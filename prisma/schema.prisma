@@ -1,0 +1,143 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MatchStatus {
+  SCHEDULED
+  OPEN
+  LIVE
+  FINISHED
+}
+
+enum RoundStatus {
+  UPCOMING
+  LOCKED
+  RESOLVED
+}
+
+enum PredictionType {
+  GOAL
+  YELLOW_CARD
+  RED_CARD
+  CORNER
+  SUBSTITUTION
+  NOTHING_HAPPENS
+}
+
+enum PredictionStatus {
+  PENDING
+  WON
+  LOST
+}
+
+enum EventType {
+  GOAL
+  YELLOW_CARD
+  RED_CARD
+  CORNER
+  SUBSTITUTION
+  UNKNOWN
+}
+
+model User {
+  id           String           @id @default(cuid())
+  username     String           @unique
+  passwordHash String
+  createdAt    DateTime         @default(now())
+  predictions  Prediction[]
+  matchStates  UserMatchState[]
+}
+
+model Match {
+  id                String           @id @default(cuid())
+  txlineFixtureId    BigInt           @unique
+  competitionId      Int
+  competition        String
+  fixtureGroupId     Int
+  homeTeam           String
+  awayTeam           String
+  homeScore          Int              @default(0)
+  awayScore          Int              @default(0)
+  participant1       String
+  participant2       String
+  participant1IsHome Boolean
+  startTime          DateTime
+  status             MatchStatus      @default(SCHEDULED)
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  rounds             Round[]
+  predictions        Prediction[]
+  events             Event[]
+  userStates         UserMatchState[]
+
+  @@index([startTime])
+  @@index([status])
+}
+
+model Round {
+  id          String       @id @default(cuid())
+  matchId     String
+  number      Int
+  startMinute Int
+  endMinute   Int
+  status      RoundStatus  @default(UPCOMING)
+  match       Match        @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  predictions Prediction[]
+
+  @@unique([matchId, number])
+}
+
+model Prediction {
+  id            String           @id @default(cuid())
+  userId        String
+  matchId       String
+  roundId       String
+  predictionType PredictionType
+  status        PredictionStatus @default(PENDING)
+  pointsAwarded Float            @default(0)
+  effectiveAt   DateTime         @default(now())
+  createdAt     DateTime         @default(now())
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  match         Match            @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  round         Round            @relation(fields: [roundId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, matchId, roundId])
+  @@index([matchId, roundId])
+}
+
+model Event {
+  id         String    @id @default(cuid())
+  matchId    String
+  txlineSeq  Int
+  txlineId   Int
+  eventType  EventType
+  minute     Int?
+  participant Int?
+  rawAction  String
+  rawPayload Json
+  createdAt  DateTime  @default(now())
+  match      Match     @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, txlineSeq])
+  @@index([matchId, createdAt])
+}
+
+model UserMatchState {
+  id        String   @id @default(cuid())
+  userId    String
+  matchId   String
+  score     Float    @default(0)
+  streak    Int      @default(0)
+  rank      Int?
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  match     Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, matchId])
+  @@index([matchId, score])
+}

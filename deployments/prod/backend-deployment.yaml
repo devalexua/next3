@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: next3-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: next3-backend
+  template:
+    metadata:
+      labels:
+        app: next3-backend
+    spec:
+      imagePullSecrets:
+        - name: ghcr-secret
+      containers:
+        - name: backend
+          image: ghcr.io/devalexua/next3-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 4000
+          env:
+            - name: SERVER_PORT
+              value: "4000"
+            - name: FRONTEND_ORIGIN
+              value: "https://YOUR_VERCEL_APP.vercel.app"
+            - name: TXLINE_BASE_URL
+              value: "https://txline.txodds.com"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: next3-backend-secrets
+                  key: DATABASE_URL
+            - name: TXLINE_GUEST_JWT
+              valueFrom:
+                secretKeyRef:
+                  name: next3-backend-secrets
+                  key: TXLINE_GUEST_JWT
+            - name: TXLINE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: next3-backend-secrets
+                  key: TXLINE_API_TOKEN
+            - name: ADMIN_TEST_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: next3-backend-secrets
+                  key: ADMIN_TEST_TOKEN
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: next3-backend-service
+spec:
+  selector:
+    app: next3-backend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 4000
+  type: ClusterIP

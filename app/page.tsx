@@ -1,0 +1,974 @@
+"use client";
+
+import { AnimatePresence, motion } from "framer-motion";
+import {
+  ArrowLeft,
+  Clock,
+  Flame,
+  LogOut,
+  ShieldCheck,
+  Sparkles,
+  Trophy,
+  Zap,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { io, type Socket } from "socket.io-client";
+
+type User = {
+  id: string;
+  username: string;
+};
+
+type Match = {
+  id: string;
+  txlineFixtureId: string;
+  competition: string;
+  homeTeam: string;
+  awayTeam: string;
+  homeScore: number;
+  awayScore: number;
+  startTime: string;
+  opensAt: string;
+  status: "SCHEDULED" | "OPEN" | "LIVE" | "FINISHED";
+};
+
+type Round = {
+  id: string;
+  number: number;
+  startMinute: number;
+  endMinute: number;
+  status: "UPCOMING" | "LOCKED" | "RESOLVED";
+};
+
+type EventRecord = {
+  id: string;
+  matchId: string;
+  eventType: PredictionType | "UNKNOWN";
+  minute: number | null;
+  participant: number | null;
+  rawAction: string;
+  createdAt: string;
+  simulated?: boolean;
+  title?: string;
+  subtitle?: string;
+  teamName?: string | null;
+  playerName?: string | null;
+  playerId?: number | null;
+  playerInId?: number | null;
+  playerOutId?: number | null;
+};
+
+type PredictionType =
+  | "GOAL"
+  | "YELLOW_CARD"
+  | "RED_CARD"
+  | "CORNER"
+  | "SUBSTITUTION"
+  | "NOTHING_HAPPENS";
+
+type Prediction = {
+  id: string;
+  roundId: string;
+  predictionType: PredictionType;
+  status: "PENDING" | "WON" | "LOST";
+  pointsAwarded: number;
+  effectiveAt: string;
+  createdAt: string;
+  round: Round;
+};
+
+type MatchDetail = {
+  match: Match;
+  rounds: Round[];
+  activePredictionRound: Round | null;
+  currentRound: Round | null;
+  events: EventRecord[];
+  myPredictions: Prediction[];
+  myState: { score: number; streak: number } | null;
+};
+
+type LeaderboardRow = {
+  rank: number;
+  username: string;
+  score: number;
+  streak?: number;
+  bestStreak?: number;
+};
+
+type TestGameStatus = {
+  enabled: boolean;
+  matchId: string | null;
+  startedAt: string | null;
+  minute: number;
+};
+
+const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
+
+const predictionOptions: Array<{ label: string; value: PredictionType; points: number; icon: string; tone: string }> = [
+  { label: "Goal", value: "GOAL", points: 7, icon: "⚽", tone: "from-lime-300 to-emerald-400" },
+  { label: "Yellow Card", value: "YELLOW_CARD", points: 5, icon: "🟨", tone: "from-yellow-300 to-amber-400" },
+  { label: "Red Card", value: "RED_CARD", points: 20, icon: "🟥", tone: "from-red-400 to-rose-500" },
+  { label: "Corner", value: "CORNER", points: 2, icon: "🚩", tone: "from-sky-300 to-cyan-400" },
+  { label: "Substitution", value: "SUBSTITUTION", points: 2, icon: "🔄", tone: "from-fuchsia-300 to-pink-400" },
+  { label: "Nothing Happens", value: "NOTHING_HAPPENS", points: 1, icon: "⏱", tone: "from-zinc-200 to-slate-300" },
+];
+
+export default function Home() {
+  const [user, setUser] = useState<User | null>(null);
+  const [matches, setMatches] = useState<Match[]>([]);
+  const [selectedMatchId, setSelectedMatchId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<MatchDetail | null>(null);
+  const [matchLeaderboard, setMatchLeaderboard] = useState<LeaderboardRow[]>([]);
+  const [globalLeaderboard, setGlobalLeaderboard] = useState<LeaderboardRow[]>([]);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [liveBanner, setLiveBanner] = useState<EventRecord | null>(null);
+  const [confetti, setConfetti] = useState(false);
+  const [showAdminTest, setShowAdminTest] = useState(false);
+  const [adminToken, setAdminToken] = useState("");
+  const [testGameStatus, setTestGameStatus] = useState<TestGameStatus>({ enabled: false, matchId: null, startedAt: null, minute: 0 });
+  const [simulatedEvents, setSimulatedEvents] = useState<EventRecord[]>([]);
+  const [now, setNow] = useState(Date.now());
+  const socketRef = useRef<Socket | null>(null);
+  const shownEventNotificationsRef = useRef<Map<string, number>>(new Map());
+  const shownPredictionWinsRef = useRef<Set<string>>(new Set());
+
+  const loadMatches = useCallback(() => {
+    fetch(`${apiUrl}/api/matches`)
+      .then((response) => response.json())
+      .then((data) => setMatches(data.matches ?? []))
+      .catch(() => undefined);
+  }, []);
+
+  const loadGlobalLeaderboard = useCallback(() => {
+    fetch(`${apiUrl}/api/leaderboard`)
+      .then((response) => response.json())
+      .then((data) => setGlobalLeaderboard(data.leaderboard ?? []))
+      .catch(() => undefined);
+  }, []);
+
+  const loadTestGameStatus = useCallback(() => {
+    fetch(`${apiUrl}/api/admin/test-game/status`)
+      .then((response) => response.json())
+      .then((data) => setTestGameStatus(data))
+      .catch(() => undefined);
+  }, []);
+
+  const loadMatchDetail = useCallback((matchId: string) => {
+    fetch(`${apiUrl}/api/matches/${matchId}`, { credentials: "include" })
+      .then((response) => response.json())
+      .then((data) => setDetail(data))
+      .catch(() => undefined);
+
+    fetch(`${apiUrl}/api/matches/${matchId}/leaderboard`)
+      .then((response) => response.json())
+      .then((data) => setMatchLeaderboard(data.leaderboard ?? []))
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    fetch(`${apiUrl}/api/me`, { credentials: "include" })
+      .then((response) => response.json())
+      .then((data) => setUser(data.user ?? null))
+      .catch(() => undefined);
+
+    loadMatches();
+    loadGlobalLeaderboard();
+    const interval = setInterval(() => {
+      loadMatches();
+      loadGlobalLeaderboard();
+    }, 30_000);
+
+    return () => clearInterval(interval);
+  }, [loadGlobalLeaderboard, loadMatches]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    setShowAdminTest(params.get("test") === "1" || params.get("adminTest") === "1");
+  }, []);
+
+  useEffect(() => {
+    if (!showAdminTest) return;
+
+    loadTestGameStatus();
+    const interval = setInterval(loadTestGameStatus, 30_000);
+    return () => clearInterval(interval);
+  }, [loadTestGameStatus, showAdminTest]);
+
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    if (!selectedMatchId) return;
+
+    loadMatchDetail(selectedMatchId);
+    const interval = setInterval(() => loadMatchDetail(selectedMatchId), 10_000);
+    return () => clearInterval(interval);
+  }, [loadMatchDetail, selectedMatchId]);
+
+  useEffect(() => {
+    const socket = io(apiUrl, { withCredentials: true, transports: ["websocket", "polling"] });
+    socketRef.current = socket;
+
+    socket.on("event_created", (event: EventRecord) => {
+      const shouldNotifyForOpenMatch =
+        selectedMatchId !== null &&
+        event.matchId === selectedMatchId &&
+        event.eventType !== "UNKNOWN" &&
+        shouldShowEventNotification(event, shownEventNotificationsRef.current);
+
+      if (shouldNotifyForOpenMatch) {
+        setLiveBanner(event);
+        window.setTimeout(() => setLiveBanner(null), 3200);
+      }
+
+      if (event.simulated) {
+        if (!showAdminTest) return;
+        if (event.matchId === selectedMatchId) {
+          setSimulatedEvents((current) => [event, ...current].slice(0, 30));
+        }
+        return;
+      }
+
+      if (event.matchId === selectedMatchId) {
+        loadMatchDetail(event.matchId);
+      }
+    });
+
+    socket.on("prediction_won", (payload: { predictionId: string; userId: string; matchId: string; pointsAwarded: number; streak: number; event: EventRecord }) => {
+      if (payload.userId !== user?.id) return;
+      if (payload.matchId !== selectedMatchId) return;
+      if (shownPredictionWinsRef.current.has(payload.predictionId)) return;
+
+      shownPredictionWinsRef.current.add(payload.predictionId);
+      setNotice(`Correct! +${formatScore(payload.pointsAwarded)} points`);
+      if (payload.event.eventType === "GOAL" || payload.streak >= 5) triggerConfetti(setConfetti);
+      loadMatchDetail(payload.matchId);
+      window.setTimeout(() => setNotice(""), 3600);
+    });
+
+    socket.on("leaderboard_updated", (payload: { matchId?: string }) => {
+      loadGlobalLeaderboard();
+      if (payload.matchId && payload.matchId === selectedMatchId) loadMatchDetail(payload.matchId);
+    });
+
+    socket.on("match_score_updated", (payload: { matchId: string; homeScore: number; awayScore: number }) => {
+      setMatches((current) =>
+        current.map((match) =>
+          match.id === payload.matchId ? { ...match, homeScore: payload.homeScore, awayScore: payload.awayScore } : match,
+        ),
+      );
+
+      if (payload.matchId === selectedMatchId) {
+        setDetail((current) =>
+          current
+            ? { ...current, match: { ...current.match, homeScore: payload.homeScore, awayScore: payload.awayScore } }
+            : current,
+        );
+      }
+    });
+
+    socket.on("round_finished", (payload: { matchId?: string }) => {
+      if (selectedMatchId && (!payload.matchId || payload.matchId === selectedMatchId)) {
+        loadMatchDetail(selectedMatchId);
+      }
+    });
+
+    socket.on("test_game_status", (status: TestGameStatus) => {
+      if (!showAdminTest) return;
+      setTestGameStatus(status);
+      if (!status.enabled) setSimulatedEvents([]);
+    });
+
+    return () => {
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, [loadGlobalLeaderboard, loadMatchDetail, selectedMatchId, showAdminTest, user?.id]);
+
+  const selectedMatch = selectedMatchId ? matches.find((match) => match.id === selectedMatchId) ?? detail?.match ?? null : null;
+
+  async function submitAuth(event: React.FormEvent) {
+    event.preventDefault();
+    setError("");
+
+    const response = await fetch(`${apiUrl}/api/auth/${authMode}`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      setError(data.error || "Authentication failed.");
+      return;
+    }
+
+    setUser(data.user);
+    if (selectedMatchId) loadMatchDetail(selectedMatchId);
+  }
+
+  async function logout() {
+    await fetch(`${apiUrl}/api/auth/logout`, { method: "POST", credentials: "include" });
+    setUser(null);
+    setDetail((current) => current ? { ...current, myPredictions: [], myState: null } : current);
+  }
+
+  return (
+    <main className="game-shell mx-auto flex min-h-screen w-full max-w-md flex-col px-4 py-5">
+      <div className="stadium-lights" aria-hidden="true" />
+      <LiveOverlays event={liveBanner} notice={notice} confetti={confetti} />
+
+      {selectedMatch ? (
+        <MatchExperience
+          detail={detail}
+          fallbackMatch={selectedMatch}
+          leaderboard={matchLeaderboard}
+          user={user}
+          now={now}
+          onBack={() => {
+            setSelectedMatchId(null);
+            setDetail(null);
+            setMatchLeaderboard([]);
+            setSimulatedEvents([]);
+          }}
+          adminToken={adminToken}
+          setAdminToken={setAdminToken}
+          showAdminTest={showAdminTest}
+          testGameStatus={testGameStatus}
+          simulatedEvents={showAdminTest ? simulatedEvents : []}
+          onRefreshTestGameStatus={loadTestGameStatus}
+          onSubmit={async (predictionType) => {
+            if (!user) {
+              setNotice("Log in to make predictions.");
+              window.setTimeout(() => setNotice(""), 2600);
+              return;
+            }
+
+            const response = await fetch(`${apiUrl}/api/matches/${selectedMatch.id}/predictions`, {
+              method: "POST",
+              credentials: "include",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ predictionType }),
+            });
+            const data = await response.json();
+            if (!response.ok) {
+              setNotice(data.error || "Prediction failed.");
+              window.setTimeout(() => setNotice(""), 3200);
+              return;
+            }
+
+            setNotice(`${formatPrediction(data.prediction.predictionType)} saved for this round`);
+            loadMatchDetail(selectedMatch.id);
+            window.setTimeout(() => setNotice(""), 2600);
+          }}
+        />
+      ) : (
+        <>
+          <Header user={user} onLogout={logout} />
+          {!user ? (
+            <AuthPanel
+              authMode={authMode}
+              setAuthMode={setAuthMode}
+              username={username}
+              setUsername={setUsername}
+              password={password}
+              setPassword={setPassword}
+              error={error}
+              onSubmit={submitAuth}
+            />
+          ) : (
+            <UserStrip user={user} />
+          )}
+          <MatchList matches={matches} now={now} onSelect={setSelectedMatchId} />
+          <GlobalLeaderboard rows={globalLeaderboard} />
+        </>
+      )}
+    </main>
+  );
+}
+
+function Header({ user, onLogout }: { user: User | null; onLogout: () => void }) {
+  return (
+    <header className="relative mb-5 overflow-hidden rounded-lg border border-lime-300/20 bg-black/35 p-4 shadow-2xl shadow-lime-950/30">
+      <div className="score-sweep" aria-hidden="true" />
+      <div className="relative flex items-start justify-between gap-3">
+        <div>
+          <div className="mb-2 inline-flex items-center gap-2 rounded-full border border-lime-300/25 bg-lime-300/10 px-3 py-1 text-xs font-black uppercase tracking-normal text-lime-100">
+            <Zap size={15} />
+            Next3
+          </div>
+          <h1 className="text-4xl font-black leading-none tracking-normal text-white">World Cup Rush</h1>
+          <div className="mt-3 flex items-center gap-2 text-sm font-semibold text-white/65">
+            <Flame className="text-rose-300" size={17} />
+            3-minute prediction rounds
+          </div>
+        </div>
+        {user ? (
+          <button onClick={onLogout} className="grid h-10 w-10 shrink-0 place-items-center rounded-full border border-white/10 bg-white/8 text-white" aria-label="Log out">
+            <LogOut size={18} />
+          </button>
+        ) : null}
+      </div>
+    </header>
+  );
+}
+
+function AuthPanel(props: {
+  authMode: "login" | "register";
+  setAuthMode: (mode: "login" | "register") => void;
+  username: string;
+  setUsername: (value: string) => void;
+  password: string;
+  setPassword: (value: string) => void;
+  error: string;
+  onSubmit: (event: React.FormEvent) => void;
+}) {
+  return (
+    <section className="mb-5 rounded-lg border border-white/10 bg-black/25 p-4 shadow-2xl shadow-black/20">
+      <div className="mb-4 flex rounded-md bg-black/35 p-1">
+        {(["login", "register"] as const).map((mode) => (
+          <button
+            key={mode}
+            onClick={() => props.setAuthMode(mode)}
+            className={`h-10 flex-1 rounded text-sm font-medium capitalize ${props.authMode === mode ? "bg-lime-300 text-black" : "text-white/70"}`}
+          >
+            {mode}
+          </button>
+        ))}
+      </div>
+      <form onSubmit={props.onSubmit} className="space-y-3">
+        <input value={props.username} onChange={(event) => props.setUsername(event.target.value)} placeholder="Username" className="h-12 w-full rounded-md border border-white/10 bg-black/30 px-3 text-white outline-none focus:border-lime-300" />
+        <input value={props.password} onChange={(event) => props.setPassword(event.target.value)} placeholder="Password" type="password" className="h-12 w-full rounded-md border border-white/10 bg-black/30 px-3 text-white outline-none focus:border-lime-300" />
+        {props.error ? <p className="text-sm text-red-300">{props.error}</p> : null}
+        <button className="h-12 w-full rounded-md bg-lime-300 font-semibold text-black">Continue</button>
+      </form>
+    </section>
+  );
+}
+
+function UserStrip({ user }: { user: User }) {
+  return (
+    <section className="mb-5 flex items-center gap-3 rounded-lg border border-lime-300/20 bg-lime-300/10 p-3">
+      <ShieldCheck className="text-lime-200" size={22} />
+      <div>
+        <div className="text-sm text-white/60">Signed in as</div>
+        <div className="font-semibold text-white">{user.username}</div>
+      </div>
+    </section>
+  );
+}
+
+function MatchList({ matches, now, onSelect }: { matches: Match[]; now: number; onSelect: (id: string) => void }) {
+  const nextMatches = useMemo(() => matches.slice(0, 12), [matches]);
+
+  return (
+    <section>
+      <div className="mb-3 flex items-center justify-between">
+        <h2 className="text-lg font-semibold text-white">Pick a Match</h2>
+        <span className="rounded bg-white/10 px-2 py-1 text-xs text-white/70">{matches.length} synced</span>
+      </div>
+      <div className="space-y-3">
+        {nextMatches.map((match, index) => (
+          <motion.button
+            key={match.id}
+            onClick={() => onSelect(match.id)}
+            className="match-card group relative w-full overflow-hidden rounded-lg border border-white/10 bg-white/[0.07] p-4 text-left shadow-lg shadow-black/10"
+            initial={{ opacity: 0, y: 16, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            transition={{ delay: index * 0.035, duration: 0.28 }}
+            whileTap={{ scale: 0.98 }}
+          >
+            <div className="match-card-stripe" aria-hidden="true" />
+            <div className="mb-3 flex items-center justify-between">
+              <span className={`rounded px-2 py-1 text-xs font-semibold ${statusClass(match.status)}`}>{match.status}</span>
+              <span className="text-xs text-white/50">#{match.txlineFixtureId}</span>
+            </div>
+            <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
+              <TeamName name={match.homeTeam} align="right" />
+              <MatchScore match={match} compact />
+              <TeamName name={match.awayTeam} align="left" />
+            </div>
+            <div className="mt-4 flex items-center justify-between gap-3 text-sm">
+              <div className="flex min-w-0 items-center gap-2 text-white/65">
+                <Clock size={16} />
+                <span className="truncate">{new Date(match.startTime).toLocaleString()}</span>
+              </div>
+              <span className={now >= new Date(match.opensAt).getTime() ? "text-lime-200" : "text-white/70"}>
+                {now >= new Date(match.opensAt).getTime() ? "Open" : formatDuration(new Date(match.startTime).getTime() - now)}
+              </span>
+            </div>
+          </motion.button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MatchExperience(props: {
+  detail: MatchDetail | null;
+  fallbackMatch: Match;
+  leaderboard: LeaderboardRow[];
+  user: User | null;
+  now: number;
+  adminToken: string;
+  setAdminToken: (value: string) => void;
+  showAdminTest: boolean;
+  testGameStatus: TestGameStatus;
+  simulatedEvents: EventRecord[];
+  onBack: () => void;
+  onRefreshTestGameStatus: () => void;
+  onSubmit: (predictionType: PredictionType) => Promise<void>;
+}) {
+  const match = props.detail?.match ?? props.fallbackMatch;
+  const predictionRound = props.detail?.activePredictionRound ?? null;
+  const currentRound = props.detail?.currentRound ?? null;
+  const myState = props.detail?.myState ?? { score: 0, streak: 0 };
+  const selectedPrediction = props.detail?.myPredictions.find((prediction) => prediction.roundId === predictionRound?.id);
+  const lockAt = predictionRound ? new Date(match.startTime).getTime() + predictionRound.endMinute * 60_000 : null;
+  const timeToLock = lockAt ? lockAt - props.now : null;
+  const finalSeconds = timeToLock !== null && timeToLock > 0 && timeToLock <= 10_000;
+  const predictionsClosed = !predictionRound || finalSeconds || (timeToLock !== null && timeToLock <= 0);
+
+  const visibleEvents = dedupeTimelineEvents([...props.simulatedEvents, ...(props.detail?.events ?? [])]).slice(0, 30);
+
+  return (
+    <section className="pb-6">
+      <button onClick={props.onBack} className="mb-4 flex h-10 items-center gap-2 rounded-md border border-white/10 bg-white/8 px-3 text-sm font-medium text-white">
+        <ArrowLeft size={17} />
+        Matches
+      </button>
+
+      <div className="match-stage mb-4 overflow-hidden rounded-lg border border-white/10 bg-black/30">
+        <div className="relative border-b border-white/10 bg-white/[0.06] p-4">
+          <div className="pulse-ring" aria-hidden="true" />
+          <div className="mb-2 flex items-center justify-between">
+            <span className={`rounded px-2 py-1 text-xs font-semibold ${statusClass(match.status)}`}>{match.status}</span>
+            <span className="text-xs text-white/50">TxLINE #{match.txlineFixtureId}</span>
+          </div>
+          <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
+            <TeamName name={match.homeTeam} align="right" />
+            <MatchScore match={match} />
+            <TeamName name={match.awayTeam} align="left" />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-3 divide-x divide-white/10">
+          <Stat label="Score" value={formatScore(myState.score)} />
+          <Stat label="Streak" value={`x${formatMultiplier(myState.streak)}`} active={myState.streak >= 3} />
+          <Stat label="Round" value={currentRound ? `${currentRound.startMinute}-${currentRound.endMinute}` : "Pre"} />
+        </div>
+      </div>
+
+      <section className={`mb-4 rounded-lg border p-4 ${finalSeconds ? "animate-pulse border-red-300/60 bg-red-400/10" : "border-lime-300/20 bg-lime-300/10"}`}>
+        <div className="mb-2 flex items-center justify-between">
+          <div className="text-sm font-medium text-lime-100">Current Prediction Round</div>
+          <div className="text-sm text-white/60">{predictionRound ? `${predictionRound.startMinute}' - ${predictionRound.endMinute}'` : "Closed"}</div>
+        </div>
+        <div className="flex items-end justify-between">
+          <div>
+            <div className="text-4xl font-semibold text-white">{timeToLock !== null ? formatDuration(timeToLock) : "--:--"}</div>
+            <div className="mt-1 text-sm text-white/60">
+              {predictionRound ? (predictionsClosed ? "Predictions closed for this round" : "Predictions activate after 10 seconds") : "No prediction round is open"}
+            </div>
+          </div>
+          {selectedPrediction ? (
+            <div className="rounded-md bg-black/30 px-3 py-2 text-right">
+              <div className="text-xs text-white/50">Your pick</div>
+              <div className="text-sm font-semibold text-white">{formatPrediction(selectedPrediction.predictionType)}</div>
+            </div>
+          ) : null}
+        </div>
+      </section>
+
+      <section className="mb-5">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="font-semibold text-white">Prediction</h2>
+          <span className="text-xs text-white/50">Closes in final 10 seconds</span>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          {predictionOptions.map((option) => {
+            const active = selectedPrediction?.predictionType === option.value;
+            return (
+              <motion.button
+                key={option.value}
+                disabled={predictionsClosed}
+                onClick={() => props.onSubmit(option.value)}
+                className={`relative h-[82px] overflow-hidden rounded-lg border p-3 text-left transition disabled:opacity-40 ${active ? "border-white bg-lime-300 text-black shadow-lg shadow-lime-300/20" : "border-white/10 bg-white/8 text-white"}`}
+                whileTap={{ scale: 0.96 }}
+                animate={active ? { y: [0, -2, 0] } : { y: 0 }}
+                transition={active ? { repeat: Infinity, duration: 1.4 } : undefined}
+              >
+                <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${option.tone}`} />
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-2xl leading-none">{option.icon}</span>
+                  <span className={active ? "text-xs font-black text-black/60" : "text-xs font-black text-lime-200"}>+{option.points}</span>
+                </div>
+                <div className="text-sm font-black">{option.label}</div>
+                <div className={active ? "text-xs text-black/70" : "text-xs text-white/50"}>{option.points} base points</div>
+              </motion.button>
+            );
+          })}
+        </div>
+      </section>
+
+      <RecentPredictions predictions={props.detail?.myPredictions ?? []} />
+      <Timeline events={visibleEvents} />
+      <MatchLeaderboard rows={props.leaderboard} user={props.user} />
+      {props.showAdminTest ? (
+        <AdminTestControls
+          matchId={match.id}
+          adminToken={props.adminToken}
+          setAdminToken={props.setAdminToken}
+          status={props.testGameStatus}
+          onRefresh={props.onRefreshTestGameStatus}
+        />
+      ) : null}
+    </section>
+  );
+}
+
+function RecentPredictions({ predictions }: { predictions: Prediction[] }) {
+  const recent = predictions.slice(0, 4);
+  if (recent.length === 0) return null;
+
+  return (
+    <section className="mb-5">
+      <h2 className="mb-3 font-semibold text-white">Your Rounds</h2>
+      <div className="space-y-2">
+        {recent.map((prediction) => (
+          <div key={prediction.id} className="flex items-center justify-between rounded-lg border border-white/10 bg-black/25 px-3 py-2">
+            <div>
+              <div className="text-sm font-medium text-white">{formatPrediction(prediction.predictionType)}</div>
+              <div className="text-xs text-white/50">{prediction.round.startMinute}' - {prediction.round.endMinute}'</div>
+            </div>
+            <div className={`rounded px-2 py-1 text-xs font-semibold ${prediction.status === "WON" ? "bg-lime-300 text-black" : prediction.status === "LOST" ? "bg-red-400 text-white" : "bg-white/10 text-white/70"}`}>
+              {prediction.status === "WON" ? `+${formatScore(prediction.pointsAwarded)}` : prediction.status}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function Timeline({ events }: { events: EventRecord[] }) {
+  return (
+    <section className="mb-5">
+      <h2 className="mb-3 font-semibold text-white">Live Feed</h2>
+      <div className="min-h-[108px] space-y-2 rounded-lg border border-white/10 bg-black/25 p-3">
+        {events.length === 0 ? <div className="py-8 text-center text-sm text-white/45">Waiting for TxLINE events</div> : null}
+        {events.map((event) => (
+          <motion.div layout key={event.id} className={`flex items-center gap-3 rounded-md px-3 py-2 ${event.simulated ? "border border-sky-300/30 bg-sky-300/10" : "bg-white/[0.06]"}`}>
+            <div className="w-10 text-sm font-semibold text-lime-200">{event.minute ?? "-"}'</div>
+            <div className="text-lg">{eventIcon(event.eventType)}</div>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm font-medium text-white">{event.title ?? formatPrediction(event.eventType)}</div>
+              <div className="truncate text-xs text-white/45">{event.subtitle ?? (event.simulated ? "Test game" : new Date(event.createdAt).toLocaleTimeString())}</div>
+            </div>
+          </motion.div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function dedupeTimelineEvents(events: EventRecord[]): EventRecord[] {
+  const accepted: EventRecord[] = [];
+
+  for (const event of events) {
+    if (event.simulated) {
+      if (!accepted.some((acceptedEvent) => acceptedEvent.id === event.id)) {
+        accepted.push(event);
+      }
+      continue;
+    }
+
+    const eventTime = new Date(event.createdAt).getTime();
+    const duplicate = accepted.some((acceptedEvent) => {
+      if (acceptedEvent.simulated) return false;
+      if (acceptedEvent.eventType !== event.eventType) return false;
+      if (acceptedEvent.minute !== event.minute) return false;
+      if (acceptedEvent.participant !== event.participant) return false;
+      if (acceptedEvent.rawAction !== event.rawAction) return false;
+
+      return Math.abs(new Date(acceptedEvent.createdAt).getTime() - eventTime) < 90_000;
+    });
+
+    if (!duplicate) accepted.push(event);
+  }
+
+  return accepted;
+}
+
+function shouldShowEventNotification(event: EventRecord, shownEvents: Map<string, number>): boolean {
+  const now = Date.now();
+  const key = eventNotificationKey(event);
+  const previousTimestamp = shownEvents.get(key);
+
+  for (const [storedKey, timestamp] of shownEvents) {
+    if (now - timestamp > 90_000) shownEvents.delete(storedKey);
+  }
+
+  if (previousTimestamp && now - previousTimestamp < 90_000) {
+    return false;
+  }
+
+  shownEvents.set(key, now);
+  return true;
+}
+
+function eventNotificationKey(event: EventRecord): string {
+  return [
+    event.matchId,
+    event.eventType,
+    event.minute ?? "-",
+    event.participant ?? "-",
+    event.rawAction,
+  ].join(":");
+}
+
+function MatchLeaderboard({ rows, user }: { rows: LeaderboardRow[]; user: User | null }) {
+  return (
+    <section className="mb-5">
+      <h2 className="mb-3 font-semibold text-white">Match Leaderboard</h2>
+      <LeaderboardList rows={rows} user={user} empty="No points yet" />
+    </section>
+  );
+}
+
+function AdminTestControls(props: {
+  matchId: string;
+  adminToken: string;
+  setAdminToken: (value: string) => void;
+  status: TestGameStatus;
+  onRefresh: () => void;
+}) {
+  const [message, setMessage] = useState("");
+  const enabledForThisMatch = props.status.enabled && props.status.matchId === props.matchId;
+
+  async function toggleTestGame() {
+    setMessage("");
+    const url = enabledForThisMatch ? `${apiUrl}/api/admin/test-game/stop` : `${apiUrl}/api/admin/test-game/start`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-admin-token": props.adminToken,
+      },
+      body: JSON.stringify(enabledForThisMatch ? {} : { matchId: props.matchId }),
+    });
+    const data = await response.json();
+
+    if (!response.ok) {
+      setMessage(data.error || "Test game action failed.");
+      return;
+    }
+
+    setMessage(data.enabled ? "Test game enabled for this match." : "Test game disabled.");
+    props.onRefresh();
+  }
+
+  return (
+    <section className="mt-5 rounded-lg border border-sky-300/20 bg-sky-300/10 p-4">
+      <div className="mb-3 flex items-center justify-between">
+        <div>
+          <h2 className="font-semibold text-white">Admin Test Game</h2>
+          <div className="text-xs text-white/50">Simulated only. No DB events, points, or leaderboard changes.</div>
+        </div>
+        <span className={`rounded px-2 py-1 text-xs font-semibold ${enabledForThisMatch ? "bg-sky-300 text-black" : "bg-white/10 text-white/60"}`}>
+          {enabledForThisMatch ? `Live ${props.status.minute}'` : "Off"}
+        </span>
+      </div>
+      <div className="flex gap-2">
+        <input
+          value={props.adminToken}
+          onChange={(event) => props.setAdminToken(event.target.value)}
+          placeholder="Admin token"
+          type="password"
+          className="h-11 min-w-0 flex-1 rounded-md border border-white/10 bg-black/30 px-3 text-sm text-white outline-none focus:border-sky-300"
+        />
+        <button onClick={toggleTestGame} className="h-11 rounded-md bg-sky-300 px-4 text-sm font-semibold text-black">
+          {enabledForThisMatch ? "Disable" : "Enable"}
+        </button>
+      </div>
+      {props.status.enabled && !enabledForThisMatch ? (
+        <div className="mt-3 text-xs text-white/55">A test game is already running for another match.</div>
+      ) : null}
+      {message ? <div className="mt-3 text-sm text-white/70">{message}</div> : null}
+    </section>
+  );
+}
+
+function GlobalLeaderboard({ rows }: { rows: LeaderboardRow[] }) {
+  return (
+    <section className="mt-6 pb-6">
+      <div className="mb-3 flex items-center gap-2">
+        <Trophy className="text-lime-200" size={18} />
+        <h2 className="font-semibold text-white">Global Leaders</h2>
+      </div>
+      <LeaderboardList rows={rows.slice(0, 5)} user={null} empty="Scores appear after live rounds resolve" />
+    </section>
+  );
+}
+
+function LeaderboardList({ rows, user, empty }: { rows: LeaderboardRow[]; user: User | null; empty: string }) {
+  return (
+    <div className="space-y-2 rounded-lg border border-white/10 bg-black/25 p-3">
+      {rows.length === 0 ? <div className="py-6 text-center text-sm text-white/45">{empty}</div> : null}
+      <AnimatePresence initial={false}>
+        {rows.map((row) => (
+          <motion.div
+            layout
+            key={row.username}
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            className={`flex items-center gap-3 rounded-md px-3 py-2 ${row.username === user?.username ? "bg-lime-300 text-black" : "bg-white/[0.06] text-white"}`}
+          >
+            <div className="grid h-8 w-8 place-items-center rounded-full bg-black/20 text-sm font-bold">{row.rank}</div>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm font-semibold">{row.username}</div>
+              <div className={row.username === user?.username ? "text-xs text-black/60" : "text-xs text-white/45"}>
+                Streak {row.streak ?? row.bestStreak ?? 0}
+              </div>
+            </div>
+            <div className="text-lg font-semibold">{formatScore(row.score)}</div>
+          </motion.div>
+        ))}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function LiveOverlays({ event, notice, confetti }: { event: EventRecord | null; notice: string; confetti: boolean }) {
+  return (
+    <>
+      <AnimatePresence>
+        {event ? (
+          <motion.div
+            className={`fixed left-4 right-4 top-5 z-30 mx-auto max-w-md rounded-lg border px-4 py-4 text-center shadow-2xl ${event.eventType === "GOAL" ? "border-lime-200 bg-lime-300 text-black" : "border-white/20 bg-[#172018] text-white"}`}
+            initial={{ opacity: 0, y: -24, scale: 0.96 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -24, scale: 0.96 }}
+          >
+            <div className="mb-1 text-sm font-semibold opacity-70">{event.minute ?? "-"}' {event.teamName ? `· ${event.teamName}` : ""}</div>
+            <div className="text-3xl font-black tracking-normal">{eventIcon(event.eventType)} {event.title ?? formatPrediction(event.eventType)}</div>
+            <div className="mt-2 text-base font-semibold opacity-80">{event.subtitle ?? (event.simulated ? "Test game" : "Live match event")}</div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+        {notice ? (
+          <motion.div className="fixed bottom-5 left-4 right-4 z-30 mx-auto flex max-w-md items-center gap-3 rounded-lg border border-white/10 bg-white px-4 py-3 text-black shadow-2xl" initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 24 }}>
+            <Sparkles size={18} />
+            <div className="text-sm font-semibold">{notice}</div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+      {confetti ? <Confetti /> : null}
+    </>
+  );
+}
+
+function Confetti() {
+  return (
+    <div className="pointer-events-none fixed inset-0 z-40 overflow-hidden">
+      {Array.from({ length: 24 }).map((_, index) => (
+        <span key={index} className="confetti-piece" style={{ left: `${(index * 37) % 100}%`, animationDelay: `${(index % 8) * 80}ms` }} />
+      ))}
+    </div>
+  );
+}
+
+function Stat({ label, value, active }: { label: string; value: string; active?: boolean }) {
+  return (
+    <div className="p-3 text-center">
+      <div className="text-xs text-white/45">{label}</div>
+      <div className={`mt-1 text-lg font-semibold ${active ? "text-lime-200" : "text-white"}`}>{value}</div>
+    </div>
+  );
+}
+
+function TeamName({ name, align }: { name: string; align: "left" | "right" }) {
+  return <div className={`min-w-0 text-base font-semibold text-white ${align === "right" ? "text-right" : "text-left"}`}>{name}</div>;
+}
+
+function MatchScore({ match, compact = false }: { match: Match; compact?: boolean }) {
+  if (match.status === "SCHEDULED") {
+    return <div className="rounded bg-white/10 px-2 py-1 text-xs text-white/70">vs</div>;
+  }
+
+  return (
+    <motion.div
+      key={`${match.id}-${match.homeScore}-${match.awayScore}-${compact ? "compact" : "full"}`}
+      className={
+        compact
+          ? "min-w-[54px] rounded bg-lime-300 px-2 py-1 text-center text-sm font-black text-black shadow shadow-lime-300/20"
+          : "min-w-[78px] rounded-lg border border-lime-200/40 bg-lime-300 px-3 py-2 text-center text-2xl font-black text-black shadow-lg shadow-lime-300/20"
+      }
+      initial={{ scale: 1.08 }}
+      animate={{ scale: 1 }}
+      transition={{ type: "spring", stiffness: 420, damping: 18 }}
+    >
+      {match.homeScore} - {match.awayScore}
+    </motion.div>
+  );
+}
+
+function statusClass(status: Match["status"]) {
+  if (status === "LIVE") return "bg-red-400 text-black";
+  if (status === "OPEN") return "bg-lime-300 text-black";
+  if (status === "FINISHED") return "bg-white text-black";
+  return "bg-white/10 text-white/70";
+}
+
+function eventIcon(eventType: string) {
+  if (eventType === "GOAL") return "⚽";
+  if (eventType === "YELLOW_CARD") return "🟨";
+  if (eventType === "RED_CARD") return "🟥";
+  if (eventType === "CORNER") return "🚩";
+  if (eventType === "SUBSTITUTION") return "🔄";
+  return "•";
+}
+
+function formatPrediction(value: string) {
+  return value
+    .toLowerCase()
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function formatDuration(ms: number) {
+  const abs = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(abs / 3600);
+  const minutes = Math.floor((abs % 3600) / 60);
+  const seconds = abs % 60;
+
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatScore(score: number) {
+  return Number.isInteger(score) ? String(score) : score.toFixed(1);
+}
+
+function formatMultiplier(streak: number) {
+  if (streak >= 5) return "2";
+  if (streak === 4) return "1.5";
+  if (streak === 3) return "1.25";
+  if (streak === 2) return "1.1";
+  return streak > 0 ? "1" : "0";
+}
+
+function triggerConfetti(setConfetti: (value: boolean) => void) {
+  setConfetti(true);
+  window.setTimeout(() => setConfetti(false), 1800);
+}

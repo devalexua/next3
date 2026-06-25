@@ -1,0 +1,50 @@
+{
+  "name": "next3-txline-probe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:backend && npm run build:frontend",
+    "build:backend": "prisma generate && tsc -p tsconfig.server.json",
+    "build:frontend": "next build",
+    "dev:backend": "npm run build:backend --silent && node --watch dist/src/server/index.js",
+    "dev:frontend": "next dev",
+    "dev": "npm run dev:backend",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "txline:auth": "npm run build:backend --silent && node dist/scripts/txline-auth.js",
+    "txline:fixtures": "npm run build:backend --silent && node dist/scripts/txline-fixtures.js",
+    "txline:stream": "npm run build:backend --silent && node dist/scripts/txline-stream.js",
+    "txline:snapshot": "npm run build:backend --silent && node dist/scripts/txline-snapshot.js",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/react": "19.2.17",
+    "typescript": "^5.5.3"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/cors": "^11.2.0",
+    "@prisma/client": "^6.19.0",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "@tailwindcss/postcss": "^4.3.1",
+    "bcryptjs": "^3.0.3",
+    "bs58": "^6.0.0",
+    "dotenv": "^17.4.2",
+    "fastify": "^5.8.5",
+    "framer-motion": "^12.41.0",
+    "lucide-react": "^1.21.0",
+    "next": "^16.2.9",
+    "postcss": "^8.5.15",
+    "prisma": "^6.19.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
+    "tailwindcss": "^4.3.1",
+    "tweetnacl": "^1.0.3"
+  }
+}

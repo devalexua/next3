@@ -1,0 +1,16 @@
+{
+  "rewrites": [
+    {
+      "source": "/health",
+      "destination": "http://lb-0a1db6266130460faf008026230e32a3-1.upcloudlb.com/health"
+    },
+    {
+      "source": "/api/:path*",
+      "destination": "http://lb-0a1db6266130460faf008026230e32a3-1.upcloudlb.com/api/:path*"
+    },
+    {
+      "source": "/socket.io/:path*",
+      "destination": "http://lb-0a1db6266130460faf008026230e32a3-1.upcloudlb.com/socket.io/:path*"
+    }
+  ]
+}
