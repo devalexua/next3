@@ -183,7 +183,7 @@ RoomPrediction @@unique([userId, roomId, roundId])
 
 Room predictions do not update the public match leaderboard or global leaderboard. They only update the leaderboard for that room.
 
-If the existing prediction is still pending, the user may change it during the open part of the round. Changing a prediction resets its activation delay.
+After a user selects a prediction, it enters a 10-second confirmation window. During that window the user may cancel it and choose a different prediction for the same round. Once the 10 seconds pass, the prediction is locked and cannot be changed or canceled.
 
 ### Anti-Sniping Delay
 
@@ -199,13 +199,15 @@ PREDICTION_ACTIVATION_DELAY_SECONDS = 10
 PREDICTION_CLOSE_BEFORE_ROUND_END_SECONDS = 10
 ```
 
-When a prediction is created or changed, `Prediction.effectiveAt` is set to now + 10 seconds. A live event only awards a prediction if:
+When a prediction is created, `Prediction.effectiveAt` is set to now + 10 seconds. A live event only awards a prediction if:
 
 ```text
 prediction.effectiveAt <= event.createdAt
 ```
 
 This prevents a player from watching a live stream, seeing an event, and immediately submitting a matching prediction.
+
+Canceled predictions use `PredictionStatus.CANCELED` and are ignored by scoring. Because the database still enforces one row per user/round, a canceled prediction can be reused if the user submits a new prediction in the same round before predictions close.
 
 ### Scoring
 
@@ -305,6 +307,7 @@ Migrations:
 20260625120000_match_scores
 20260625123000_prediction_effective_at
 20260626120000_friend_rooms
+20260626123000_cancelable_predictions
 ```
 
 ## REST API
@@ -338,6 +341,7 @@ Predictions:
 
 ```text
 POST /api/matches/:id/predictions
+POST /api/matches/:id/predictions/cancel
 ```
 
 Friend rooms:
@@ -349,6 +353,7 @@ POST /api/rooms/join
 GET  /api/rooms/:code
 GET  /api/rooms/:code/leaderboard
 POST /api/rooms/:code/predictions
+POST /api/rooms/:code/predictions/cancel
 ```
 
 Room creation body:

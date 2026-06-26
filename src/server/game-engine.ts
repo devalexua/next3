@@ -43,6 +43,32 @@ export async function ingestNormalizedEvent(normalized: NormalizedTxLineScoreEve
 
   await ensureRounds(match.id);
 
+  const existingEvent = await prisma.event.findFirst({
+    where: {
+      matchId: match.id,
+      txlineId: normalized.txlineId,
+      eventType: normalized.eventType as EventType,
+    },
+    orderBy: { createdAt: "asc" },
+  });
+
+  if (existingEvent) {
+    const shouldUpdatePayload = isRicherPayload(normalized.raw, existingEvent.rawPayload);
+    const updatedEvent = shouldUpdatePayload
+      ? await prisma.event.update({
+          where: { id: existingEvent.id },
+          data: {
+            minute: existingEvent.minute ?? normalized.matchMinute,
+            participant: existingEvent.participant ?? normalized.participant,
+            rawAction: normalized.rawAction.length > existingEvent.rawAction.length ? normalized.rawAction : existingEvent.rawAction,
+            rawPayload: normalized.raw as Prisma.InputJsonValue,
+          },
+        })
+      : existingEvent;
+
+    return { event: updatedEvent, wonPredictions: [] };
+  }
+
   const event = await prisma.event.upsert({
     where: { matchId_txlineSeq: { matchId: match.id, txlineSeq: normalized.sequence } },
     create: {
@@ -76,9 +102,19 @@ export async function ingestNormalizedEvent(normalized: NormalizedTxLineScoreEve
   return { event, wonPredictions };
 }
 
+function isRicherPayload(nextPayload: unknown, currentPayload: unknown): boolean {
+  return JSON.stringify(nextPayload).length > JSON.stringify(currentPayload).length;
+}
+
 export async function closeExpiredRounds(): Promise<number> {
   const liveMatches = await prisma.match.findMany({
-    where: { status: { in: [MatchStatus.OPEN, MatchStatus.LIVE] } },
+    where: {
+      OR: [
+        { status: { in: [MatchStatus.OPEN, MatchStatus.LIVE] } },
+        { predictions: { some: { status: PredictionStatus.PENDING } } },
+        { roomPredictions: { some: { status: PredictionStatus.PENDING } } },
+      ],
+    },
     include: { rounds: true },
   });
 
@@ -89,8 +125,23 @@ export async function closeExpiredRounds(): Promise<number> {
     const elapsedMinutes = Math.floor((Date.now() - match.startTime.getTime()) / 60_000);
     if (elapsedMinutes < 0) continue;
 
+    const pendingPredictions = await prisma.prediction.findMany({
+      where: { matchId: match.id, status: PredictionStatus.PENDING },
+      select: { roundId: true },
+    });
+    const pendingRoomPredictions = await prisma.roomPrediction.findMany({
+      where: { matchId: match.id, status: PredictionStatus.PENDING },
+      select: { roundId: true },
+    });
+    const roundsWithPendingPredictions = new Set([
+      ...pendingPredictions.map((prediction) => prediction.roundId),
+      ...pendingRoomPredictions.map((prediction) => prediction.roundId),
+    ]);
+
     const expiredRounds = match.rounds.filter(
-      (round) => round.endMinute <= elapsedMinutes && round.status !== RoundStatus.RESOLVED,
+      (round) =>
+        round.endMinute <= elapsedMinutes &&
+        (round.status !== RoundStatus.RESOLVED || roundsWithPendingPredictions.has(round.id)),
     );
 
     for (const round of expiredRounds) {
@@ -253,7 +304,15 @@ async function resolveRoundMisses(
     },
   });
 
-  if (pending.length === 0) return;
+  const pendingRoomPredictions = await prisma.roomPrediction.findMany({
+    where: {
+      matchId: match.id,
+      roundId,
+      status: PredictionStatus.PENDING,
+    },
+  });
+
+  if (pending.length === 0 && pendingRoomPredictions.length === 0) return;
 
   const roundEvents = await prisma.event.findMany({
     where: {
@@ -302,14 +361,6 @@ async function resolveRoundMisses(
       }),
     ]);
   }
-
-  const pendingRoomPredictions = await prisma.roomPrediction.findMany({
-    where: {
-      matchId: match.id,
-      roundId,
-      status: PredictionStatus.PENDING,
-    },
-  });
 
   for (const prediction of pendingRoomPredictions) {
     if (prediction.predictionType === PredictionType.NOTHING_HAPPENS && !hasScoringEvent) {

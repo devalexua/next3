@@ -5,7 +5,7 @@ import type {
 } from "./types.js";
 
 const actionMap: Array<[RegExp, TxLineScoreEventType]> = [
-  [/\bgoal\b|\bscore_adjustment\b/i, "GOAL"],
+  [/\bgoal\b/i, "GOAL"],
   [/\byellow[\s_-]?card\b/i, "YELLOW_CARD"],
   [/\bred[\s_-]?card\b/i, "RED_CARD"],
   [/\bcorner\b|\bcorner_(?:kick|awarded)\b/i, "CORNER"],
@@ -26,7 +26,7 @@ export function normalizeScoreRecord(record: TxLineScoresRecord): NormalizedTxLi
     .join(" ");
 
   return {
-    eventType: mapActionToEventType(rawAction),
+    eventType: mapActionToEventType(rawAction, record.action ?? record.Action),
     fixtureId: record.fixtureId ?? record.FixtureId ?? 0,
     txlineId: record.id ?? record.Id ?? 0,
     sequence: record.seq ?? record.Seq ?? 0,
@@ -38,7 +38,10 @@ export function normalizeScoreRecord(record: TxLineScoresRecord): NormalizedTxLi
   };
 }
 
-function mapActionToEventType(action: string): TxLineScoreEventType {
+function mapActionToEventType(action: string, primaryAction: string | undefined): TxLineScoreEventType {
+  const primary = (primaryAction || "").toLowerCase();
+  if (primary === "var" || primary === "score_adjustment") return "UNKNOWN";
+
   for (const [pattern, eventType] of actionMap) {
     if (pattern.test(action)) return eventType;
   }

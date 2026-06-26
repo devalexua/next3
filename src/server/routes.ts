@@ -16,6 +16,10 @@ type PredictionBody = {
   predictionType?: PredictionType;
 };
 
+type CancelPredictionBody = {
+  predictionId?: string;
+};
+
 type RoomBody = {
   matchId?: string;
   name?: string;
@@ -149,7 +153,7 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
       take: 40,
     });
 
-    return { matches: matches.map(serializeMatch) };
+    return { matches: await Promise.all(matches.map(serializeMatch)) };
   });
 
   app.get("/api/matches/:id", async (request, reply) => {
@@ -185,7 +189,7 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
       : null;
 
     return {
-      match: serializeMatch(match),
+      match: await serializeMatch(match),
       rounds,
       activePredictionRound: getPredictionRound(match.startTime, rounds),
       currentRound: getCurrentRound(match.startTime, rounds),
@@ -257,7 +261,7 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
     });
 
     return {
-      rooms: rooms.map((room) => serializeRoom(room)),
+      rooms: await Promise.all(rooms.map((room) => serializeRoom(room))),
     };
   });
 
@@ -283,7 +287,7 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
       },
     });
 
-    return { room: serializeRoom(room) };
+    return { room: await serializeRoom(room) };
   });
 
   app.post("/api/rooms/join", async (request, reply) => {
@@ -310,7 +314,7 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
       include: { match: true, members: { select: { id: true } } },
     });
 
-    return { room: serializeRoom(updatedRoom) };
+    return { room: await serializeRoom(updatedRoom) };
   });
 
   app.get("/api/rooms/:code", async (request, reply) => {
@@ -341,8 +345,8 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
     });
 
     return {
-      room: serializeRoom(room),
-      match: serializeMatch(room.match),
+      room: await serializeRoom(room),
+      match: await serializeMatch(room.match),
       rounds,
       activePredictionRound: getPredictionRound(room.match.startTime, rounds),
       currentRound: getCurrentRound(room.match.startTime, rounds),
@@ -400,27 +404,64 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
 
     const existingPrediction = await prisma.prediction.findUnique({
       where: { userId_matchId_roundId: { userId: user.id, matchId: match.id, roundId: round.id } },
-      select: { id: true, status: true },
+      select: { id: true, status: true, effectiveAt: true },
     });
 
-    if (existingPrediction && existingPrediction.status !== PredictionStatus.PENDING) {
-      return reply.code(409).send({ error: "This round has already been resolved." });
+    if (existingPrediction && existingPrediction.status !== PredictionStatus.CANCELED) {
+      return reply.code(409).send({ error: "You already have a prediction for this round." });
     }
 
     const effectiveAt = new Date(now + PREDICTION_ACTIVATION_DELAY_SECONDS * 1000);
-    const prediction = await prisma.prediction.upsert({
-      where: { userId_matchId_roundId: { userId: user.id, matchId: match.id, roundId: round.id } },
-      create: {
-        userId: user.id,
-        matchId: match.id,
-        roundId: round.id,
-        predictionType: body.predictionType,
-        effectiveAt,
-      },
-      update: { predictionType: body.predictionType, effectiveAt },
-    });
+    const prediction = existingPrediction?.status === PredictionStatus.CANCELED
+      ? await prisma.prediction.update({
+          where: { id: existingPrediction.id },
+          data: {
+            predictionType: body.predictionType,
+            status: PredictionStatus.PENDING,
+            pointsAwarded: 0,
+            effectiveAt,
+          },
+        })
+      : await prisma.prediction.create({
+          data: {
+            userId: user.id,
+            matchId: match.id,
+            roundId: round.id,
+            predictionType: body.predictionType,
+            effectiveAt,
+          },
+        });
 
     return { prediction, activationDelaySeconds: PREDICTION_ACTIVATION_DELAY_SECONDS };
+  });
+
+  app.post("/api/matches/:id/predictions/cancel", async (request, reply) => {
+    const user = await requireUser(request);
+    const { id } = request.params as { id: string };
+    const body = request.body as CancelPredictionBody;
+
+    if (!body.predictionId) return reply.code(400).send({ error: "predictionId is required." });
+
+    const prediction = await prisma.prediction.findFirst({
+      where: {
+        id: body.predictionId,
+        userId: user.id,
+        matchId: id,
+        status: PredictionStatus.PENDING,
+      },
+    });
+
+    if (!prediction) return reply.code(404).send({ error: "Pending prediction not found." });
+    if (prediction.effectiveAt.getTime() <= Date.now()) {
+      return reply.code(409).send({ error: "Prediction is already locked." });
+    }
+
+    const canceled = await prisma.prediction.update({
+      where: { id: prediction.id },
+      data: { status: PredictionStatus.CANCELED },
+    });
+
+    return { prediction: canceled };
   });
 
   app.post("/api/rooms/:code/predictions", async (request, reply) => {
@@ -455,28 +496,68 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
 
     const existingPrediction = await prisma.roomPrediction.findUnique({
       where: { userId_roomId_roundId: { userId: user.id, roomId: room.id, roundId: round.id } },
-      select: { id: true, status: true },
+      select: { id: true, status: true, effectiveAt: true },
     });
 
-    if (existingPrediction && existingPrediction.status !== PredictionStatus.PENDING) {
-      return reply.code(409).send({ error: "This round has already been resolved." });
+    if (existingPrediction && existingPrediction.status !== PredictionStatus.CANCELED) {
+      return reply.code(409).send({ error: "You already have a prediction for this round." });
     }
 
     const effectiveAt = new Date(now + PREDICTION_ACTIVATION_DELAY_SECONDS * 1000);
-    const prediction = await prisma.roomPrediction.upsert({
-      where: { userId_roomId_roundId: { userId: user.id, roomId: room.id, roundId: round.id } },
-      create: {
-        userId: user.id,
-        roomId: room.id,
-        matchId: room.match.id,
-        roundId: round.id,
-        predictionType: body.predictionType,
-        effectiveAt,
-      },
-      update: { predictionType: body.predictionType, effectiveAt },
-    });
+    const prediction = existingPrediction?.status === PredictionStatus.CANCELED
+      ? await prisma.roomPrediction.update({
+          where: { id: existingPrediction.id },
+          data: {
+            predictionType: body.predictionType,
+            status: PredictionStatus.PENDING,
+            pointsAwarded: 0,
+            effectiveAt,
+          },
+        })
+      : await prisma.roomPrediction.create({
+          data: {
+            userId: user.id,
+            roomId: room.id,
+            matchId: room.match.id,
+            roundId: round.id,
+            predictionType: body.predictionType,
+            effectiveAt,
+          },
+        });
 
     return { prediction, activationDelaySeconds: PREDICTION_ACTIVATION_DELAY_SECONDS };
+  });
+
+  app.post("/api/rooms/:code/predictions/cancel", async (request, reply) => {
+    const user = await requireUser(request);
+    const { code } = request.params as { code: string };
+    const body = request.body as CancelPredictionBody;
+
+    if (!body.predictionId) return reply.code(400).send({ error: "predictionId is required." });
+
+    const room = await getJoinedRoom(code, user.id);
+    if (!room) return reply.code(404).send({ error: "Room not found or you have not joined it." });
+
+    const prediction = await prisma.roomPrediction.findFirst({
+      where: {
+        id: body.predictionId,
+        userId: user.id,
+        roomId: room.id,
+        status: PredictionStatus.PENDING,
+      },
+    });
+
+    if (!prediction) return reply.code(404).send({ error: "Pending prediction not found." });
+    if (prediction.effectiveAt.getTime() <= Date.now()) {
+      return reply.code(409).send({ error: "Prediction is already locked." });
+    }
+
+    const canceled = await prisma.roomPrediction.update({
+      where: { id: prediction.id },
+      data: { status: PredictionStatus.CANCELED },
+    });
+
+    return { prediction: canceled };
   });
 }
 
@@ -490,7 +571,7 @@ function isAdminRequest(token: string | string[] | undefined): boolean {
   return value === serverEnv.adminTestToken;
 }
 
-function serializeMatch(match: {
+async function serializeMatch(match: {
   id: string;
   txlineFixtureId: bigint;
   competitionId: number;
@@ -499,6 +580,7 @@ function serializeMatch(match: {
   awayTeam: string;
   homeScore: number;
   awayScore: number;
+  participant1IsHome: boolean;
   startTime: Date;
   status: MatchStatus;
 }) {
@@ -510,14 +592,26 @@ function serializeMatch(match: {
   };
 }
 
-function serializeRoom(room: {
+async function serializeRoom(room: {
   id: string;
   code: string;
   name: string;
   matchId: string;
   createdByUserId: string;
   createdAt: Date;
-  match: Parameters<typeof serializeMatch>[0];
+  match: {
+    id: string;
+    txlineFixtureId: bigint;
+    competitionId: number;
+    competition: string;
+    homeTeam: string;
+    awayTeam: string;
+    homeScore: number;
+    awayScore: number;
+    participant1IsHome: boolean;
+    startTime: Date;
+    status: MatchStatus;
+  };
   members?: Array<{ id: string }>;
 }) {
   return {
@@ -528,7 +622,7 @@ function serializeRoom(room: {
     createdByUserId: room.createdByUserId,
     createdAt: room.createdAt.toISOString(),
     memberCount: room.members?.length ?? 0,
-    match: serializeMatch(room.match),
+    match: await serializeMatch(room.match),
   };
 }
 
@@ -606,11 +700,12 @@ function dedupeEvents(events: Event[]): Event[] {
   const accepted: Event[] = [];
 
   for (const event of events) {
+    if (isNonDisplayEvent(event)) continue;
+
     const duplicate = accepted.some((acceptedEvent) => {
       if (acceptedEvent.eventType !== event.eventType) return false;
       if (acceptedEvent.minute !== event.minute) return false;
       if (acceptedEvent.participant !== event.participant) return false;
-      if (acceptedEvent.rawAction !== event.rawAction) return false;
 
       return Math.abs(acceptedEvent.createdAt.getTime() - event.createdAt.getTime()) < 90_000;
     });
@@ -619,6 +714,11 @@ function dedupeEvents(events: Event[]): Event[] {
   }
 
   return accepted;
+}
+
+function isNonDisplayEvent(event: Event): boolean {
+  const primaryAction = event.rawAction.split(" ")[0]?.toLowerCase();
+  return primaryAction === "var" || primaryAction === "score_adjustment";
 }
 
 function getPredictionRound(startTime: Date, rounds: Array<{ id: string; number: number; startMinute: number; endMinute: number }>) {

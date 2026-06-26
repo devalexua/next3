@@ -1,0 +1,2 @@
+-- AlterEnum
+ALTER TYPE "PredictionStatus" ADD VALUE IF NOT EXISTS 'CANCELED';

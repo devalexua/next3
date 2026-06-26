@@ -7,7 +7,6 @@ import {
   Copy,
   Flame,
   LogOut,
-  Play,
   Plus,
   ShieldCheck,
   Sparkles,
@@ -74,7 +73,7 @@ type Prediction = {
   id: string;
   roundId: string;
   predictionType: PredictionType;
-  status: "PENDING" | "WON" | "LOST";
+  status: "PENDING" | "WON" | "LOST" | "CANCELED";
   pointsAwarded: number;
   effectiveAt: string;
   createdAt: string;
@@ -150,7 +149,6 @@ export default function Home() {
   const [globalCurrentUserRank, setGlobalCurrentUserRank] = useState<LeaderboardRow | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [homeTab, setHomeTab] = useState<HomeTab>("games");
-  const [showIntro, setShowIntro] = useState(true);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [joinRoomCode, setJoinRoomCode] = useState("");
@@ -386,6 +384,14 @@ export default function Home() {
       }
     });
 
+    socket.on("round_started", (payload: { matchId?: string }) => {
+      if (selectedRoomCode && (!payload.matchId || payload.matchId === openMatchId)) {
+        loadRoomDetail(selectedRoomCode);
+      } else if (selectedMatchId && (!payload.matchId || payload.matchId === selectedMatchId)) {
+        loadMatchDetail(selectedMatchId);
+      }
+    });
+
     socket.on("test_game_status", (status: TestGameStatus) => {
       if (!showAdminTest) return;
       setTestGameStatus(status);
@@ -491,9 +497,7 @@ export default function Home() {
       <div className="stadium-lights" aria-hidden="true" />
       <LiveOverlays event={liveBanner} notice={notice} confetti={confetti} />
 
-      {showIntro ? (
-        <IntroScreen onContinue={() => setShowIntro(false)} />
-      ) : selectedMatch ? (
+      {selectedMatch ? (
         <MatchExperience
           detail={selectedRoom ? roomDetail : detail}
           fallbackMatch={selectedMatch}
@@ -536,7 +540,28 @@ export default function Home() {
               return;
             }
 
-            setNotice(`${formatPrediction(data.prediction.predictionType)} saved for this round`);
+            setNotice(`${formatPrediction(data.prediction.predictionType)} confirms in 10 seconds`);
+            if (selectedRoom) loadRoomDetail(selectedRoom.code);
+            else loadMatchDetail(selectedMatch.id);
+            window.setTimeout(() => setNotice(""), 2600);
+          }}
+          onCancelPrediction={async (predictionId) => {
+            if (!user) return;
+
+            const response = await fetch(selectedRoom ? `${apiUrl}/api/rooms/${selectedRoom.code}/predictions/cancel` : `${apiUrl}/api/matches/${selectedMatch.id}/predictions/cancel`, {
+              method: "POST",
+              credentials: "include",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ predictionId }),
+            });
+            const data = await response.json();
+            if (!response.ok) {
+              setNotice(data.error || "Could not cancel prediction.");
+              window.setTimeout(() => setNotice(""), 3200);
+              return;
+            }
+
+            setNotice("Prediction canceled. Choose another one.");
             if (selectedRoom) loadRoomDetail(selectedRoom.code);
             else loadMatchDetail(selectedMatch.id);
             window.setTimeout(() => setNotice(""), 2600);
@@ -605,52 +630,6 @@ export default function Home() {
         </>
       )}
     </main>
-  );
-}
-
-function IntroScreen({ onContinue }: { onContinue: () => void }) {
-  return (
-    <section className="flex min-h-[calc(100vh-2.5rem)] flex-col justify-center">
-      <div className="relative overflow-hidden rounded-lg border border-lime-300/25 bg-black/35 p-5 shadow-2xl shadow-lime-950/30">
-        <div className="score-sweep" aria-hidden="true" />
-        <div className="relative">
-          <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-lime-300/25 bg-lime-300/10 px-3 py-1 text-xs font-black uppercase tracking-normal text-lime-100">
-            <Zap size={15} />
-            Next3
-          </div>
-          <h1 className="text-5xl font-black leading-none tracking-normal text-white">World Cup Rush</h1>
-          <p className="mt-4 text-lg font-semibold leading-snug text-white/78">
-            Predict what happens next in live World Cup matches.
-          </p>
-          <p className="mt-3 text-sm leading-relaxed text-white/58">
-            Inspired by fast prediction markets, Next3 turns every match into 3-minute rounds where fans compete on goals, cards, corners, substitutions, or quiet stretches. Powered by TxLINE live football data.
-          </p>
-
-          <div className="mt-6 grid grid-cols-3 gap-2">
-            <IntroStat label="Round" value="3 min" />
-            <IntroStat label="Source" value="TxLINE" />
-            <IntroStat label="Mode" value="No betting" />
-          </div>
-
-          <button
-            onClick={onContinue}
-            className="mt-6 flex h-13 w-full items-center justify-center gap-2 rounded-md bg-lime-300 text-base font-black text-black shadow-lg shadow-lime-300/20"
-          >
-            <Play size={18} fill="currentColor" />
-            Enter Game
-          </button>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function IntroStat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-md border border-white/10 bg-white/[0.06] p-3 text-center">
-      <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-white/38">{label}</div>
-      <div className="mt-1 text-sm font-black text-white">{value}</div>
-    </div>
   );
 }
 
@@ -894,19 +873,27 @@ function MatchExperience(props: {
   onBack: () => void;
   onRefreshTestGameStatus: () => void;
   onSubmit: (predictionType: PredictionType) => Promise<void>;
+  onCancelPrediction: (predictionId: string) => Promise<void>;
 }) {
   const [activeTab, setActiveTab] = useState<MatchPanelTab>("feed");
   const match = props.detail?.match ?? props.fallbackMatch;
-  const predictionRound = props.detail?.activePredictionRound ?? null;
-  const currentRound = props.detail?.currentRound ?? null;
+  const rounds = props.detail?.rounds ?? [];
+  const predictionRound = getRoundAtTime(match.startTime, rounds, props.now);
+  const currentRound = predictionRound;
   const myState = props.detail?.myState ?? { score: 0, streak: 0 };
-  const selectedPrediction = props.detail?.myPredictions.find((prediction) => prediction.roundId === predictionRound?.id);
+  const selectedPrediction = props.detail?.myPredictions.find((prediction) => prediction.roundId === predictionRound?.id && prediction.status !== "CANCELED");
   const elapsedMs = props.now - new Date(match.startTime).getTime();
   const fullTime = match.status === "FINISHED" || elapsedMs >= matchDurationMinutes * 60_000;
   const lockAt = predictionRound ? new Date(match.startTime).getTime() + predictionRound.endMinute * 60_000 : null;
   const timeToLock = lockAt ? lockAt - props.now : null;
   const finalSeconds = timeToLock !== null && timeToLock > 0 && timeToLock <= 10_000;
   const predictionsClosed = !predictionRound || finalSeconds || (timeToLock !== null && timeToLock <= 0);
+  const activationRemainingMs = selectedPrediction ? new Date(selectedPrediction.effectiveAt).getTime() - props.now : 0;
+  const canCancelPrediction = selectedPrediction?.status === "PENDING" && activationRemainingMs > 0;
+  const selectedPredictionLocked = selectedPrediction?.status === "PENDING" && activationRemainingMs <= 0;
+  const predictionButtonsDisabled = predictionsClosed || Boolean(selectedPrediction);
+  const confirmationSecondsRemaining = Math.max(0, Math.ceil(activationRemainingMs / 1000));
+  const confirmationProgress = canCancelPrediction ? Math.min(100, Math.max(0, ((10_000 - activationRemainingMs) / 10_000) * 100)) : 100;
 
   const recentPredictions = props.detail?.myPredictions ?? [];
   const visibleEvents = dedupeTimelineEvents([...props.simulatedEvents, ...(props.detail?.events ?? [])]).slice(0, 30);
@@ -973,7 +960,7 @@ function MatchExperience(props: {
               </div>
               {selectedPrediction ? (
                 <div className="rounded-md bg-black/30 px-3 py-2 text-right">
-                  <div className="text-xs text-white/50">Your pick</div>
+                  <div className="text-xs text-white/50">{canCancelPrediction ? "Confirming" : selectedPredictionLocked ? "Locked pick" : "Your pick"}</div>
                   <div className="text-sm font-semibold text-white">{formatPrediction(selectedPrediction.predictionType)}</div>
                 </div>
               ) : null}
@@ -991,7 +978,7 @@ function MatchExperience(props: {
                 return (
                   <motion.button
                     key={option.value}
-                    disabled={predictionsClosed}
+                    disabled={predictionButtonsDisabled}
                     onClick={() => props.onSubmit(option.value)}
                     className={`relative h-[82px] overflow-hidden rounded-lg border p-3 text-left transition disabled:opacity-40 ${active ? "border-white bg-lime-300 text-black shadow-lg shadow-lime-300/20" : "border-white/10 bg-white/8 text-white"}`}
                     whileTap={{ scale: 0.96 }}
@@ -1009,6 +996,46 @@ function MatchExperience(props: {
                 );
               })}
             </div>
+            {selectedPrediction ? (
+              <div className="mt-3 rounded-lg border border-white/10 bg-black/25 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-white">
+                      {canCancelPrediction ? "Confirming prediction" : "Prediction locked"}
+                    </div>
+                    <div className="mt-1 text-xs text-white/50">
+                      {canCancelPrediction
+                        ? "You can cancel before it activates. Events only count after activation."
+                        : "This round's prediction cannot be changed."}
+                    </div>
+                  </div>
+                  {canCancelPrediction ? (
+                    <button
+                      onClick={() => props.onCancelPrediction(selectedPrediction.id)}
+                      className="h-10 rounded-md border border-red-300/40 bg-red-400/10 px-3 text-xs font-black text-red-100 transition hover:bg-red-400/20"
+                    >
+                      Cancel
+                    </button>
+                  ) : null}
+                </div>
+                {canCancelPrediction ? (
+                  <div className="mt-3">
+                    <div className="mb-2 flex items-end justify-between">
+                      <span className="text-xs font-semibold uppercase tracking-[0.14em] text-lime-100">Locks in</span>
+                      <span className="font-mono text-3xl font-black leading-none text-white">{confirmationSecondsRemaining}s</span>
+                    </div>
+                    <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                      <motion.div
+                        className="h-full rounded-full bg-lime-300"
+                        initial={false}
+                        animate={{ width: `${confirmationProgress}%` }}
+                        transition={{ duration: 0.2, ease: "linear" }}
+                      />
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
           </section>
         </>
       )}
@@ -1111,7 +1138,7 @@ function RoomHeader({ room }: { room: Room }) {
 }
 
 function RecentPredictions({ predictions, compact = false }: { predictions: Prediction[]; compact?: boolean }) {
-  const recent = predictions.slice(0, 4);
+  const recent = predictions.filter((prediction) => prediction.status !== "CANCELED").slice(0, 4);
   if (recent.length === 0) {
     return compact ? <div className="py-8 text-center text-sm text-white/45">No predictions yet</div> : null;
   }
@@ -1161,6 +1188,8 @@ function dedupeTimelineEvents(events: EventRecord[]): EventRecord[] {
   const accepted: EventRecord[] = [];
 
   for (const event of events) {
+    if (isNonDisplayTimelineEvent(event)) continue;
+
     if (event.simulated) {
       if (!accepted.some((acceptedEvent) => acceptedEvent.id === event.id)) {
         accepted.push(event);
@@ -1174,7 +1203,6 @@ function dedupeTimelineEvents(events: EventRecord[]): EventRecord[] {
       if (acceptedEvent.eventType !== event.eventType) return false;
       if (acceptedEvent.minute !== event.minute) return false;
       if (acceptedEvent.participant !== event.participant) return false;
-      if (acceptedEvent.rawAction !== event.rawAction) return false;
 
       return Math.abs(new Date(acceptedEvent.createdAt).getTime() - eventTime) < 90_000;
     });
@@ -1183,6 +1211,11 @@ function dedupeTimelineEvents(events: EventRecord[]): EventRecord[] {
   }
 
   return accepted;
+}
+
+function isNonDisplayTimelineEvent(event: EventRecord): boolean {
+  const primaryAction = event.rawAction.split(" ")[0]?.toLowerCase();
+  return primaryAction === "var" || primaryAction === "score_adjustment";
 }
 
 function shouldShowEventNotification(event: EventRecord, shownEvents: Map<string, number>): boolean {
@@ -1453,6 +1486,17 @@ function formatDuration(ms: number) {
 
 function formatScore(score: number) {
   return Number.isInteger(score) ? String(score) : score.toFixed(1);
+}
+
+function getRoundAtTime(startTime: string, rounds: Round[], now: number) {
+  const kickoff = new Date(startTime).getTime();
+  if (!Number.isFinite(kickoff) || now < kickoff) return null;
+
+  const elapsedMinute = Math.floor((now - kickoff) / 60_000);
+  if (elapsedMinute >= matchDurationMinutes) return null;
+
+  const roundNumber = Math.floor(elapsedMinute / 3) + 1;
+  return rounds.find((round) => round.number === roundNumber) ?? null;
 }
 
 function formatMultiplier(streak: number) {

@@ -29,7 +29,7 @@ export function presentEvent(event: Event, match: MatchTeamInfo): PresentedEvent
   const playerId = findFirstNumber(data, ["PlayerId"]);
   const playerInId = findFirstNumber(data, ["PlayerInId"]);
   const playerOutId = findFirstNumber(data, ["PlayerOutId"]);
-  const playerLabel = playerName ?? (playerId ? `Player #${playerId}` : null);
+  const playerLabel = playerName;
   const teamLabel = teamName ?? "Unknown team";
 
   return {
@@ -87,8 +87,6 @@ function subtitleForEvent(
   }
 
   if (eventType === "SUBSTITUTION") {
-    if (playerInId && playerOutId) return `${teamName}: #${playerInId} on, #${playerOutId} off`;
-    if (playerInId) return `${teamName}: #${playerInId} comes on`;
     return `${teamName} makes a substitution`;
   }
 

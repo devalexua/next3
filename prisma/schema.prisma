@@ -33,6 +33,7 @@ enum PredictionStatus {
   PENDING
   WON
   LOST
+  CANCELED
 }
 
 enum EventType {

@@ -44,7 +44,7 @@ export function startTxLineScoresWorker(io: Server, logger: FastifyBaseLogger): 
         }
       })
       .catch((error) => logger.error({ error }, "Round close job failed"));
-  }, 15_000);
+  }, 3_000);
 
   return {
     stop: () => {
@@ -155,10 +155,12 @@ async function updateMatchScoreFromRecord(
   raw: TxLineScoresRecord,
   match: { id: string; participant1IsHome: boolean; homeScore: number; awayScore: number },
 ): Promise<{ matchId: string; homeScore: number; awayScore: number } | null> {
-  const participant1Score = raw.scoreSoccer?.Participant1?.Total?.Goals;
-  const participant2Score = raw.scoreSoccer?.Participant2?.Total?.Goals;
+  const currentParticipant1Score = match.participant1IsHome ? match.homeScore : match.awayScore;
+  const currentParticipant2Score = match.participant1IsHome ? match.awayScore : match.homeScore;
+  const participant1Score = extractParticipantGoals(raw, "Participant1") ?? currentParticipant1Score;
+  const participant2Score = extractParticipantGoals(raw, "Participant2") ?? currentParticipant2Score;
 
-  if (typeof participant1Score !== "number" || typeof participant2Score !== "number") return null;
+  if (participant1Score === currentParticipant1Score && participant2Score === currentParticipant2Score) return null;
 
   const homeScore = match.participant1IsHome ? participant1Score : participant2Score;
   const awayScore = match.participant1IsHome ? participant2Score : participant1Score;
@@ -171,6 +173,26 @@ async function updateMatchScoreFromRecord(
   });
 
   return { matchId: match.id, homeScore, awayScore };
+}
+
+function extractParticipantGoals(raw: TxLineScoresRecord, participantKey: "Participant1" | "Participant2"): number | null {
+  const score = asObject(raw.scoreSoccer) ?? asObject((raw as { ScoreSoccer?: unknown }).ScoreSoccer) ?? asObject(raw.Score);
+  const participant = asObject(score?.[participantKey]) ?? asObject(score?.[participantKey.toLowerCase()]);
+  const total = asObject(participant?.Total) ?? asObject(participant?.total);
+
+  return getNumber(total?.Goals) ?? getNumber(total?.goals) ?? null;
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function getNumber(value: unknown): number | null {
+  if (typeof value === "number") return value;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number(value);
+  return null;
 }
 
 async function serializeEvent(event: Event) {
