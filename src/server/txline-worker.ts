@@ -102,6 +102,10 @@ async function streamScores(
         const tracked = await getTrackedMatch(normalized.fixtureId);
         if (!tracked) continue;
 
+        const clockUpdate = await updateMatchClockFromRecord(raw, tracked);
+        if (clockUpdate) {
+          io.emit("match_clock_updated", clockUpdate);
+        }
         const scoreUpdate = await updateMatchScoreFromRecord(raw, tracked);
         if (scoreUpdate) {
           io.emit("match_score_updated", scoreUpdate);
@@ -141,14 +145,73 @@ async function getTrackedMatch(fixtureId: number): Promise<{
   participant1IsHome: boolean;
   homeScore: number;
   awayScore: number;
+  clockSeconds: number;
+  clockRunning: boolean;
 } | null> {
   const match = await prisma.match.findUnique({
     where: { txlineFixtureId: BigInt(fixtureId) },
-    select: { id: true, status: true, participant1IsHome: true, homeScore: true, awayScore: true },
+    select: { id: true, status: true, participant1IsHome: true, homeScore: true, awayScore: true, clockSeconds: true, clockRunning: true },
   });
 
   if (!match || match.status === MatchStatus.FINISHED) return null;
   return match;
+}
+
+async function updateMatchClockFromRecord(
+  raw: TxLineScoresRecord,
+  match: { id: string; status: MatchStatus; clockSeconds: number; clockRunning: boolean },
+): Promise<{ matchId: string; status: MatchStatus; clockSeconds: number; clockRunning: boolean } | null> {
+  const status = soccerStatusFromRecord(raw);
+  const clock = soccerClockFromRecord(raw);
+  const data: { status?: MatchStatus; clockSeconds?: number; clockRunning?: boolean } = {};
+
+  if (status) data.status = status;
+  if (clock) {
+    data.clockSeconds = clock.seconds;
+    data.clockRunning = clock.running;
+    if (clock.running) data.status = MatchStatus.LIVE;
+  }
+
+  if (Object.keys(data).length === 0) return null;
+
+  const nextStatus = data.status ?? match.status;
+  const nextClockSeconds = data.clockSeconds ?? match.clockSeconds;
+  const nextClockRunning = data.clockRunning ?? match.clockRunning;
+
+  if (
+    nextStatus === match.status &&
+    nextClockSeconds === match.clockSeconds &&
+    nextClockRunning === match.clockRunning
+  ) {
+    return null;
+  }
+
+  await prisma.match.update({ where: { id: match.id }, data });
+  return {
+    matchId: match.id,
+    status: nextStatus,
+    clockSeconds: nextClockSeconds,
+    clockRunning: nextClockRunning,
+  };
+}
+
+function soccerStatusFromRecord(raw: TxLineScoresRecord): MatchStatus | null {
+  const statusId = getNumber(raw.statusSoccerId) ?? getNumber(raw.StatusId);
+  const action = String(raw.action ?? raw.Action ?? "").toLowerCase();
+
+  if (statusId === 3 || action === "halftime_finalised") return MatchStatus.HALF_TIME;
+  if (statusId === 2 || statusId === 4) return MatchStatus.LIVE;
+  if (statusId !== null && statusId >= 5) return MatchStatus.FINISHED;
+  return null;
+}
+
+function soccerClockFromRecord(raw: TxLineScoresRecord): { seconds: number; running: boolean } | null {
+  const clock = asObject(raw.Clock) ?? asObject((raw as { clock?: unknown }).clock);
+  const seconds = getNumber(clock?.Seconds) ?? getNumber(clock?.seconds);
+  const running = getBoolean(clock?.Running) ?? getBoolean(clock?.running);
+
+  if (seconds === null || running === null) return null;
+  return { seconds, running };
 }
 
 async function updateMatchScoreFromRecord(
@@ -193,6 +256,10 @@ function getNumber(value: unknown): number | null {
   if (typeof value === "number") return value;
   if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number(value);
   return null;
+}
+
+function getBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
 }
 
 async function serializeEvent(event: Event) {

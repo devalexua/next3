@@ -30,9 +30,11 @@ type Match = {
   awayTeam: string;
   homeScore: number;
   awayScore: number;
+  clockSeconds: number;
+  clockRunning: boolean;
   startTime: string;
   opensAt: string;
-  status: "SCHEDULED" | "OPEN" | "LIVE" | "FINISHED";
+  status: "SCHEDULED" | "OPEN" | "LIVE" | "HALF_TIME" | "FINISHED";
 };
 
 type Round = {
@@ -232,7 +234,7 @@ export default function Home() {
     const interval = setInterval(() => {
       loadMatches();
       loadGlobalLeaderboard();
-    }, 30_000);
+    }, 10_000);
 
     return () => clearInterval(interval);
   }, [loadGlobalLeaderboard, loadMatches]);
@@ -371,6 +373,31 @@ export default function Home() {
         setRoomDetail((current) =>
           current
             ? { ...current, match: { ...current.match, homeScore: payload.homeScore, awayScore: payload.awayScore } }
+            : current,
+        );
+      }
+    });
+
+    socket.on("match_clock_updated", (payload: { matchId: string; status: Match["status"]; clockSeconds: number; clockRunning: boolean }) => {
+      setMatches((current) =>
+        current.map((match) =>
+          match.id === payload.matchId
+            ? { ...match, status: payload.status, clockSeconds: payload.clockSeconds, clockRunning: payload.clockRunning }
+            : match,
+        ),
+      );
+
+      if (payload.matchId === selectedMatchId) {
+        setDetail((current) =>
+          current
+            ? { ...current, match: { ...current.match, status: payload.status, clockSeconds: payload.clockSeconds, clockRunning: payload.clockRunning } }
+            : current,
+        );
+      }
+      if (selectedRoomCode && payload.matchId === openMatchId) {
+        setRoomDetail((current) =>
+          current
+            ? { ...current, match: { ...current.match, status: payload.status, clockSeconds: payload.clockSeconds, clockRunning: payload.clockRunning } }
             : current,
         );
       }
@@ -816,7 +843,7 @@ function MatchList({
             <div className="match-card-stripe" aria-hidden="true" />
             <button onClick={() => onSelect(match.id)} className="relative block w-full text-left">
               <div className="mb-3 flex items-center justify-between gap-2">
-                <span className={`rounded px-2 py-1 text-xs font-semibold ${statusClass(match.status)}`}>{match.status}</span>
+                <span className={`rounded px-2 py-1 text-xs font-semibold ${statusClass(match.status)}`}>{formatStatus(match.status)}</span>
                 <span className="text-xs text-white/50">#{match.txlineFixtureId}</span>
               </div>
               <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
@@ -878,14 +905,13 @@ function MatchExperience(props: {
   const [activeTab, setActiveTab] = useState<MatchPanelTab>("feed");
   const match = props.detail?.match ?? props.fallbackMatch;
   const rounds = props.detail?.rounds ?? [];
-  const predictionRound = getRoundAtTime(match.startTime, rounds, props.now);
+  const predictionRound = getRoundAtTime(match, rounds, props.now);
   const currentRound = predictionRound;
   const myState = props.detail?.myState ?? { score: 0, streak: 0 };
   const selectedPrediction = props.detail?.myPredictions.find((prediction) => prediction.roundId === predictionRound?.id && prediction.status !== "CANCELED");
-  const elapsedMs = props.now - new Date(match.startTime).getTime();
-  const fullTime = match.status === "FINISHED" || elapsedMs >= matchDurationMinutes * 60_000;
-  const lockAt = predictionRound ? new Date(match.startTime).getTime() + predictionRound.endMinute * 60_000 : null;
-  const timeToLock = lockAt ? lockAt - props.now : null;
+  const fullTime = match.status === "FINISHED" || match.clockSeconds >= matchDurationMinutes * 60;
+  const halfTime = isHalfTime(match, props.now);
+  const timeToLock = predictionRound ? getMsUntilRoundEnd(match, predictionRound, props.now) : null;
   const finalSeconds = timeToLock !== null && timeToLock > 0 && timeToLock <= 10_000;
   const predictionsClosed = !predictionRound || finalSeconds || (timeToLock !== null && timeToLock <= 0);
   const activationRemainingMs = selectedPrediction ? new Date(selectedPrediction.effectiveAt).getTime() - props.now : 0;
@@ -921,7 +947,7 @@ function MatchExperience(props: {
         <div className="relative border-b border-white/10 bg-white/[0.06] p-4">
           <div className="pulse-ring" aria-hidden="true" />
           <div className="mb-2 flex items-center justify-between">
-            <span className={`rounded px-2 py-1 text-xs font-semibold ${statusClass(match.status)}`}>{match.status}</span>
+            <span className={`rounded px-2 py-1 text-xs font-semibold ${statusClass(match.status)}`}>{formatStatus(match.status)}</span>
             <span className="text-xs text-white/50">{props.room ? `Room ${props.room.code}` : `TxLINE #${match.txlineFixtureId}`}</span>
           </div>
           <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
@@ -934,7 +960,7 @@ function MatchExperience(props: {
         <div className="grid grid-cols-3 divide-x divide-white/10">
           <Stat label="Score" value={formatScore(myState.score)} />
           <Stat label="Streak" value={`x${formatMultiplier(myState.streak)}`} active={myState.streak >= 3} />
-          <Stat label="Round" value={fullTime ? "FT" : currentRound ? `${currentRound.startMinute}-${currentRound.endMinute}` : "Pre"} />
+          <Stat label="Round" value={fullTime ? "FT" : halfTime ? "HT" : currentRound ? `${currentRound.startMinute}-${currentRound.endMinute}` : "Pre"} />
         </div>
       </div>
 
@@ -955,7 +981,7 @@ function MatchExperience(props: {
               <div>
                 <div className="text-4xl font-semibold text-white">{timeToLock !== null ? formatDuration(timeToLock) : "--:--"}</div>
                 <div className="mt-1 text-sm text-white/60">
-                  {predictionRound ? (predictionsClosed ? "Predictions closed for this round" : "Predictions activate after 10 seconds") : "No prediction round is open"}
+                  {halfTime ? "Half-time break. Predictions resume in the second half." : predictionRound ? (predictionsClosed ? "Predictions closed for this round" : "Predictions activate after 10 seconds") : "No prediction round is open"}
                 </div>
               </div>
               {selectedPrediction ? (
@@ -967,37 +993,21 @@ function MatchExperience(props: {
             </div>
           </section>
 
+          {halfTime ? (
+            <section className="mb-5 rounded-lg border border-yellow-300/45 bg-yellow-300/12 p-4 text-center shadow-lg shadow-yellow-300/10">
+              <div className="text-xs font-black uppercase tracking-[0.18em] text-yellow-100">Half-Time Break</div>
+              <div className="mt-2 text-2xl font-black text-white">Predictions Paused</div>
+              <div className="mt-1 text-sm text-white/60">Rounds resume automatically when TxLINE reports the second half has started.</div>
+            </section>
+          ) : null}
+
           <section className="mb-5">
             <div className="mb-3 flex items-center justify-between">
               <h2 className="font-semibold text-white">Prediction</h2>
-              <span className="text-xs text-white/50">Closes in final 10 seconds</span>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              {predictionOptions.map((option) => {
-                const active = selectedPrediction?.predictionType === option.value;
-                return (
-                  <motion.button
-                    key={option.value}
-                    disabled={predictionButtonsDisabled}
-                    onClick={() => props.onSubmit(option.value)}
-                    className={`relative h-[82px] overflow-hidden rounded-lg border p-3 text-left transition disabled:opacity-40 ${active ? "border-white bg-lime-300 text-black shadow-lg shadow-lime-300/20" : "border-white/10 bg-white/8 text-white"}`}
-                    whileTap={{ scale: 0.96 }}
-                    animate={active ? { y: [0, -2, 0] } : { y: 0 }}
-                    transition={active ? { repeat: Infinity, duration: 1.4 } : undefined}
-                  >
-                    <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${option.tone}`} />
-                    <div className="mb-2 flex items-center justify-between">
-                      <span className="text-2xl leading-none">{option.icon}</span>
-                      <span className={active ? "text-xs font-black text-black/60" : "text-xs font-black text-lime-200"}>+{option.points}</span>
-                    </div>
-                    <div className="text-sm font-black">{option.label}</div>
-                    <div className={active ? "text-xs text-black/70" : "text-xs text-white/50"}>{option.points} base points</div>
-                  </motion.button>
-                );
-              })}
+              <span className="text-xs text-white/50">{halfTime ? "Paused" : "Closes in final 10 seconds"}</span>
             </div>
             {selectedPrediction ? (
-              <div className="mt-3 rounded-lg border border-white/10 bg-black/25 p-3">
+              <div className={`mb-3 rounded-lg border p-3 ${canCancelPrediction ? "border-lime-300/45 bg-lime-300/12 shadow-lg shadow-lime-300/10" : "border-white/10 bg-black/25"}`}>
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <div className="text-sm font-semibold text-white">
@@ -1036,6 +1046,36 @@ function MatchExperience(props: {
                 ) : null}
               </div>
             ) : null}
+            {halfTime ? (
+              <div className="rounded-lg border border-white/10 bg-black/25 px-4 py-6 text-center text-sm font-semibold text-white/55">
+                Waiting for second half kickoff
+              </div>
+            ) : (
+            <div className="grid grid-cols-2 gap-2">
+              {predictionOptions.map((option) => {
+                const active = selectedPrediction?.predictionType === option.value;
+                return (
+                  <motion.button
+                    key={option.value}
+                    disabled={predictionButtonsDisabled}
+                    onClick={() => props.onSubmit(option.value)}
+                    className={`relative h-[82px] overflow-hidden rounded-lg border p-3 text-left transition disabled:opacity-40 ${active ? "border-white bg-lime-300 text-black shadow-lg shadow-lime-300/20" : "border-white/10 bg-white/8 text-white"}`}
+                    whileTap={{ scale: 0.96 }}
+                    animate={active ? { y: [0, -2, 0] } : { y: 0 }}
+                    transition={active ? { repeat: Infinity, duration: 1.4 } : undefined}
+                  >
+                    <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${option.tone}`} />
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className="text-2xl leading-none">{option.icon}</span>
+                      <span className={active ? "text-xs font-black text-black/60" : "text-xs font-black text-lime-200"}>+{option.points}</span>
+                    </div>
+                    <div className="text-sm font-black">{option.label}</div>
+                    <div className={active ? "text-xs text-black/70" : "text-xs text-white/50"}>{option.points} base points</div>
+                  </motion.button>
+                );
+              })}
+            </div>
+            )}
           </section>
         </>
       )}
@@ -1215,7 +1255,7 @@ function dedupeTimelineEvents(events: EventRecord[]): EventRecord[] {
 
 function isNonDisplayTimelineEvent(event: EventRecord): boolean {
   const primaryAction = event.rawAction.split(" ")[0]?.toLowerCase();
-  return primaryAction === "var" || primaryAction === "score_adjustment";
+  return primaryAction === "var" || primaryAction === "score_adjustment" || primaryAction === "action_amend";
 }
 
 function shouldShowEventNotification(event: EventRecord, shownEvents: Map<string, number>): boolean {
@@ -1452,9 +1492,14 @@ function MatchScore({ match, compact = false }: { match: Match; compact?: boolea
 
 function statusClass(status: Match["status"]) {
   if (status === "LIVE") return "bg-red-400 text-black";
+  if (status === "HALF_TIME") return "bg-yellow-300 text-black";
   if (status === "OPEN") return "bg-lime-300 text-black";
   if (status === "FINISHED") return "bg-white text-black";
   return "bg-white/10 text-white/70";
+}
+
+function formatStatus(status: Match["status"]) {
+  return status.replace(/_/g, " ");
 }
 
 function eventIcon(eventType: string) {
@@ -1488,15 +1533,47 @@ function formatScore(score: number) {
   return Number.isInteger(score) ? String(score) : score.toFixed(1);
 }
 
-function getRoundAtTime(startTime: string, rounds: Round[], now: number) {
-  const kickoff = new Date(startTime).getTime();
-  if (!Number.isFinite(kickoff) || now < kickoff) return null;
+function getRoundAtTime(match: Match, rounds: Round[], now: number) {
+  if (match.status !== "LIVE" && match.status !== "OPEN" && !match.clockRunning) return null;
+  if (isHalfTime(match, now)) return null;
 
-  const elapsedMinute = Math.floor((now - kickoff) / 60_000);
+  const elapsedMinute = getMatchElapsedMinute(match, now);
+  if (elapsedMinute === null) return null;
   if (elapsedMinute >= matchDurationMinutes) return null;
 
   const roundNumber = Math.floor(elapsedMinute / 3) + 1;
   return rounds.find((round) => round.number === roundNumber) ?? null;
+}
+
+function getMatchElapsedMinute(match: Match, now: number) {
+  if (match.clockSeconds > 0) return Math.floor(match.clockSeconds / 60);
+  if (match.status === "LIVE") return null;
+
+  const kickoff = new Date(match.startTime).getTime();
+  if (!Number.isFinite(kickoff) || now < kickoff) return null;
+  return Math.floor((now - kickoff) / 60_000);
+}
+
+function getMsUntilRoundEnd(match: Match, round: Round, now: number) {
+  if (match.clockSeconds > 0) {
+    return Math.max(0, (round.endMinute * 60 - match.clockSeconds) * 1000);
+  }
+  if (match.status === "LIVE") return null;
+
+  const roundEndsAt = new Date(match.startTime).getTime() + round.endMinute * 60_000;
+  return roundEndsAt - now;
+}
+
+function isHalfTime(match: Match, now: number) {
+  if (match.clockRunning && match.clockSeconds > 45 * 60) return false;
+  if (match.status === "HALF_TIME") return true;
+  if (match.status !== "LIVE") return false;
+  if (match.clockSeconds >= 45 * 60 && match.clockSeconds < 46 * 60 && !match.clockRunning) return true;
+
+  const kickoff = new Date(match.startTime).getTime();
+  if (!Number.isFinite(kickoff)) return false;
+  const wallClockMinute = Math.floor((now - kickoff) / 60_000);
+  return match.clockSeconds === 0 && wallClockMinute >= 45 && wallClockMinute < 65;
 }
 
 function formatMultiplier(streak: number) {

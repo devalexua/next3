@@ -11,6 +11,7 @@ enum MatchStatus {
   SCHEDULED
   OPEN
   LIVE
+  HALF_TIME
   FINISHED
 }
 
@@ -68,6 +69,8 @@ model Match {
   awayTeam           String
   homeScore          Int              @default(0)
   awayScore          Int              @default(0)
+  clockSeconds       Int              @default(0)
+  clockRunning       Boolean          @default(false)
   participant1       String
   participant2       String
   participant1IsHome Boolean

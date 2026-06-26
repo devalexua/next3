@@ -191,8 +191,8 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
     return {
       match: await serializeMatch(match),
       rounds,
-      activePredictionRound: getPredictionRound(match.startTime, rounds),
-      currentRound: getCurrentRound(match.startTime, rounds),
+      activePredictionRound: getPredictionRound(match, rounds),
+      currentRound: getCurrentRound(match, rounds),
       events: dedupeEvents(match.events).map((event) => presentEvent(event, match)),
       myPredictions,
       myState,
@@ -348,8 +348,8 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
       room: await serializeRoom(room),
       match: await serializeMatch(room.match),
       rounds,
-      activePredictionRound: getPredictionRound(room.match.startTime, rounds),
-      currentRound: getCurrentRound(room.match.startTime, rounds),
+      activePredictionRound: getPredictionRound(room.match, rounds),
+      currentRound: getCurrentRound(room.match, rounds),
       events: dedupeEvents(events).map((event) => presentEvent(event, room.match)),
       myPredictions,
       myState,
@@ -382,7 +382,7 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
     });
 
     if (!match) return reply.code(404).send({ error: "Match not found." });
-    if (match.status !== MatchStatus.OPEN && match.status !== MatchStatus.LIVE) {
+    if (match.status !== MatchStatus.OPEN && match.status !== MatchStatus.LIVE && !match.clockRunning) {
       return reply.code(409).send({ error: "Predictions open when the match starts." });
     }
 
@@ -390,15 +390,15 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
     const rounds = match.rounds.length > 0
       ? match.rounds
       : await prisma.round.findMany({ where: { matchId: match.id }, orderBy: { number: "asc" } });
-    const round = getPredictionRound(match.startTime, rounds);
+    const round = getPredictionRound(match, rounds);
 
     if (!round) {
       return reply.code(409).send({ error: "No prediction round is currently open." });
     }
 
-    const roundEndsAt = match.startTime.getTime() + round.endMinute * 60_000;
+    const secondsUntilRoundEnd = getSecondsUntilRoundEnd(match, round);
     const now = Date.now();
-    if (roundEndsAt - now <= PREDICTION_CLOSE_BEFORE_ROUND_END_SECONDS * 1000) {
+    if (secondsUntilRoundEnd !== null && secondsUntilRoundEnd <= PREDICTION_CLOSE_BEFORE_ROUND_END_SECONDS) {
       return reply.code(409).send({ error: "Predictions are closed for the final 10 seconds of each round." });
     }
 
@@ -476,21 +476,21 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
 
     const room = await getJoinedRoom(code, user.id);
     if (!room) return reply.code(404).send({ error: "Room not found or you have not joined it." });
-    if (room.match.status !== MatchStatus.OPEN && room.match.status !== MatchStatus.LIVE) {
+    if (room.match.status !== MatchStatus.OPEN && room.match.status !== MatchStatus.LIVE && !room.match.clockRunning) {
       return reply.code(409).send({ error: "Predictions open when the match starts." });
     }
 
     await ensureRounds(room.match.id);
     const rounds = await prisma.round.findMany({ where: { matchId: room.match.id }, orderBy: { number: "asc" } });
-    const round = getPredictionRound(room.match.startTime, rounds);
+    const round = getPredictionRound(room.match, rounds);
 
     if (!round) {
       return reply.code(409).send({ error: "No prediction round is currently open." });
     }
 
-    const roundEndsAt = room.match.startTime.getTime() + round.endMinute * 60_000;
+    const secondsUntilRoundEnd = getSecondsUntilRoundEnd(room.match, round);
     const now = Date.now();
-    if (roundEndsAt - now <= PREDICTION_CLOSE_BEFORE_ROUND_END_SECONDS * 1000) {
+    if (secondsUntilRoundEnd !== null && secondsUntilRoundEnd <= PREDICTION_CLOSE_BEFORE_ROUND_END_SECONDS) {
       return reply.code(409).send({ error: "Predictions are closed for the final 10 seconds of each round." });
     }
 
@@ -580,6 +580,8 @@ async function serializeMatch(match: {
   awayTeam: string;
   homeScore: number;
   awayScore: number;
+  clockSeconds: number;
+  clockRunning: boolean;
   participant1IsHome: boolean;
   startTime: Date;
   status: MatchStatus;
@@ -608,6 +610,8 @@ async function serializeRoom(room: {
     awayTeam: string;
     homeScore: number;
     awayScore: number;
+    clockSeconds: number;
+    clockRunning: boolean;
     participant1IsHome: boolean;
     startTime: Date;
     status: MatchStatus;
@@ -718,31 +722,52 @@ function dedupeEvents(events: Event[]): Event[] {
 
 function isNonDisplayEvent(event: Event): boolean {
   const primaryAction = event.rawAction.split(" ")[0]?.toLowerCase();
-  return primaryAction === "var" || primaryAction === "score_adjustment";
+  return primaryAction === "var" || primaryAction === "score_adjustment" || primaryAction === "action_amend";
 }
 
-function getPredictionRound(startTime: Date, rounds: Array<{ id: string; number: number; startMinute: number; endMinute: number }>) {
-  const now = Date.now();
-  const kickoff = startTime.getTime();
+function getPredictionRound(
+  match: { startTime: Date; status: MatchStatus; clockSeconds: number; clockRunning: boolean },
+  rounds: Array<{ id: string; number: number; startMinute: number; endMinute: number }>,
+) {
+  if (match.status !== MatchStatus.LIVE && match.status !== MatchStatus.OPEN && !match.clockRunning) return null;
 
-  if (now < kickoff) return null;
-
-  const elapsedMinute = Math.floor((now - kickoff) / 60_000);
-  if (elapsedMinute >= MATCH_DURATION_MINUTES) return null;
-
+  const elapsedMinute = getMatchElapsedMinute(match);
+  if (elapsedMinute === null || elapsedMinute >= MATCH_DURATION_MINUTES) return null;
   const currentRoundNumber = Math.floor(elapsedMinute / ROUND_LENGTH_MINUTES) + 1;
   return rounds.find((round) => round.number === currentRoundNumber) ?? null;
 }
 
-function getCurrentRound(startTime: Date, rounds: Array<{ id: string; number: number; startMinute: number; endMinute: number }>) {
-  const now = Date.now();
-  const kickoff = startTime.getTime();
+function getCurrentRound(
+  match: { startTime: Date; status: MatchStatus; clockSeconds: number; clockRunning: boolean },
+  rounds: Array<{ id: string; number: number; startMinute: number; endMinute: number }>,
+) {
+  if (match.status === MatchStatus.HALF_TIME && !match.clockRunning) return null;
 
-  if (now < kickoff) return null;
-
-  const elapsedMinute = Math.floor((now - kickoff) / 60_000);
-  if (elapsedMinute >= MATCH_DURATION_MINUTES) return null;
-
+  const elapsedMinute = getMatchElapsedMinute(match);
+  if (elapsedMinute === null || elapsedMinute >= MATCH_DURATION_MINUTES) return null;
   const currentRoundNumber = Math.floor(elapsedMinute / ROUND_LENGTH_MINUTES) + 1;
   return rounds.find((round) => round.number === currentRoundNumber) ?? null;
+}
+
+function getMatchElapsedMinute(match: { startTime: Date; clockSeconds: number }): number | null {
+  if (match.clockSeconds > 0) return Math.floor(match.clockSeconds / 60);
+  if ("status" in match && match.status === MatchStatus.LIVE) return null;
+
+  const kickoff = match.startTime.getTime();
+  const now = Date.now();
+  if (now < kickoff) return null;
+  return Math.floor((now - kickoff) / 60_000);
+}
+
+function getSecondsUntilRoundEnd(
+  match: { startTime: Date; clockSeconds: number },
+  round: { endMinute: number },
+): number | null {
+  if (match.clockSeconds > 0) {
+    return round.endMinute * 60 - match.clockSeconds;
+  }
+  if ("status" in match && match.status === MatchStatus.LIVE) return null;
+
+  const roundEndsAt = match.startTime.getTime() + round.endMinute * 60_000;
+  return Math.floor((roundEndsAt - Date.now()) / 1000);
 }

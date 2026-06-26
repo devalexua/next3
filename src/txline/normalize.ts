@@ -40,7 +40,7 @@ export function normalizeScoreRecord(record: TxLineScoresRecord): NormalizedTxLi
 
 function mapActionToEventType(action: string, primaryAction: string | undefined): TxLineScoreEventType {
   const primary = (primaryAction || "").toLowerCase();
-  if (primary === "var" || primary === "score_adjustment") return "UNKNOWN";
+  if (primary === "var" || primary === "score_adjustment" || primary === "action_amend") return "UNKNOWN";
 
   for (const [pattern, eventType] of actionMap) {
     if (pattern.test(action)) return eventType;

@@ -156,6 +156,8 @@ MATCH_DURATION_MINUTES = 90
 
 Users predict the current active 3-minute round, not a future round.
 
+Rounds are driven by the TxLINE soccer clock, not by wall-clock time since kickoff. When TxLINE sends half-time status, predictions pause and no new round opens during the break. When TxLINE sends second-half live status, predictions resume from the live match clock.
+
 After 90 minutes, predictions close and the frontend shows the final leaderboard instead of opening more rounds.
 
 ### Prediction Options

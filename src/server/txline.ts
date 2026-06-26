@@ -89,7 +89,7 @@ export function deriveMatchStatus(startTime: Date): MatchStatus {
 
 export async function refreshMatchStatuses(): Promise<void> {
   const matches = await prisma.match.findMany({
-    where: { status: { in: [MatchStatus.SCHEDULED, MatchStatus.OPEN, MatchStatus.LIVE] } },
+    where: { status: { in: [MatchStatus.SCHEDULED, MatchStatus.OPEN] } },
     select: { id: true, startTime: true, status: true },
   });
 

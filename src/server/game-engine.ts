@@ -122,7 +122,7 @@ export async function closeExpiredRounds(): Promise<number> {
 
   for (const match of liveMatches) {
     await ensureRounds(match.id);
-    const elapsedMinutes = Math.floor((Date.now() - match.startTime.getTime()) / 60_000);
+    const elapsedMinutes = getElapsedMinutes(match);
     if (elapsedMinutes < 0) continue;
 
     const pendingPredictions = await prisma.prediction.findMany({
@@ -155,6 +155,11 @@ export async function closeExpiredRounds(): Promise<number> {
   }
 
   return resolvedCount;
+}
+
+function getElapsedMinutes(match: Match): number {
+  if (match.clockSeconds > 0) return Math.floor(match.clockSeconds / 60);
+  return Math.floor((Date.now() - match.startTime.getTime()) / 60_000);
 }
 
 async function getRoundForMinute(matchId: string, minute: number) {
