@@ -4,8 +4,8 @@ import { clearSession, getCurrentUser, hashPassword, requireUser, setSession, ve
 import { serverEnv } from "./env.js";
 import { presentEvent } from "./event-presenter.js";
 import { prisma } from "./prisma.js";
-import type { TestGameController } from "./test-game.js";
-import { ensureRounds, refreshMatchStatuses, ROUND_LENGTH_MINUTES, syncFixtures } from "./txline.js";
+import { demoFixtureId, type TestGameController } from "./test-game.js";
+import { ensureRounds, MATCH_DURATION_MINUTES, refreshMatchStatuses, ROUND_LENGTH_MINUTES, syncFixtures } from "./txline.js";
 
 type AuthBody = {
   username?: string;
@@ -14,6 +14,12 @@ type AuthBody = {
 
 type PredictionBody = {
   predictionType?: PredictionType;
+};
+
+type RoomBody = {
+  matchId?: string;
+  name?: string;
+  code?: string;
 };
 
 type TestGameBody = {
@@ -104,10 +110,41 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
     return testGame.stop();
   });
 
+  app.get("/api/admin/demo/status", async (request, reply) => {
+    if (!isAdminRequest(request.headers["x-admin-token"])) {
+      return reply.code(401).send({ error: "Admin test token is required." });
+    }
+
+    return testGame.demoCompetitionStatus();
+  });
+
+  app.post("/api/admin/demo/start", async (request, reply) => {
+    if (!isAdminRequest(request.headers["x-admin-token"])) {
+      return reply.code(401).send({ error: "Admin test token is required." });
+    }
+
+    return testGame.startDemoCompetition();
+  });
+
+  app.post("/api/admin/demo/stop", async (request, reply) => {
+    if (!isAdminRequest(request.headers["x-admin-token"])) {
+      return reply.code(401).send({ error: "Admin test token is required." });
+    }
+
+    return testGame.stopDemoCompetition();
+  });
+
   app.get("/api/matches", async () => {
     await refreshMatchStatuses();
+    const activeDemoMatchId = testGame.demoCompetitionStatus().matchId;
     const matches = await prisma.match.findMany({
-      where: { status: { not: MatchStatus.FINISHED } },
+      where: {
+        status: { not: MatchStatus.FINISHED },
+        OR: [
+          { txlineFixtureId: { not: BigInt(demoFixtureId) } },
+          ...(activeDemoMatchId ? [{ id: activeDemoMatchId }] : []),
+        ],
+      },
       orderBy: { startTime: "asc" },
       take: 40,
     });
@@ -181,16 +218,16 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
     };
   });
 
-  app.get("/api/leaderboard", async () => {
+  app.get("/api/leaderboard", async (request) => {
+    const user = await getCurrentUser(request);
     const rows = await prisma.user.findMany({
       select: {
         username: true,
         matchStates: { select: { score: true, streak: true } },
       },
-      take: 100,
     });
 
-    const leaderboard = rows
+    const rankedRows = rows
       .map((row) => ({
         username: row.username,
         score: row.matchStates.reduce((total, state) => total + state.score, 0),
@@ -198,10 +235,131 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
       }))
       .filter((row) => row.score > 0)
       .sort((a, b) => b.score - a.score || a.username.localeCompare(b.username))
-      .slice(0, 50)
       .map((row, index) => ({ rank: index + 1, ...row }));
+    const leaderboard = rankedRows.slice(0, 50);
+    const currentUserRank = user
+      ? rankedRows.find((row) => row.username === user.username) ?? null
+      : null;
 
-    return { leaderboard };
+    return { leaderboard, currentUserRank };
+  });
+
+  app.get("/api/rooms", async (request) => {
+    const user = await requireUser(request);
+    const rooms = await prisma.room.findMany({
+      where: { members: { some: { userId: user.id } } },
+      include: {
+        match: true,
+        members: { select: { id: true } },
+      },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+    });
+
+    return {
+      rooms: rooms.map((room) => serializeRoom(room)),
+    };
+  });
+
+  app.post("/api/rooms", async (request, reply) => {
+    const user = await requireUser(request);
+    const body = request.body as RoomBody;
+    const matchId = body.matchId || "";
+
+    const match = await prisma.match.findUnique({ where: { id: matchId }, select: { id: true, homeTeam: true, awayTeam: true } });
+    if (!match) return reply.code(404).send({ error: "Match not found." });
+
+    const room = await prisma.room.create({
+      data: {
+        code: await generateRoomCode(),
+        name: normalizeRoomName(body.name) || `${match.homeTeam} vs ${match.awayTeam}`,
+        matchId: match.id,
+        createdByUserId: user.id,
+        members: { create: { userId: user.id } },
+      },
+      include: {
+        match: true,
+        members: { select: { id: true } },
+      },
+    });
+
+    return { room: serializeRoom(room) };
+  });
+
+  app.post("/api/rooms/join", async (request, reply) => {
+    const user = await requireUser(request);
+    const body = request.body as RoomBody;
+    const code = normalizeRoomCode(body.code);
+
+    if (!code) return reply.code(400).send({ error: "Room code is required." });
+
+    const room = await prisma.room.findUnique({
+      where: { code },
+      include: { match: true, members: { select: { id: true } } },
+    });
+    if (!room) return reply.code(404).send({ error: "Room not found." });
+
+    await prisma.roomMember.upsert({
+      where: { roomId_userId: { roomId: room.id, userId: user.id } },
+      create: { roomId: room.id, userId: user.id },
+      update: {},
+    });
+
+    const updatedRoom = await prisma.room.findUniqueOrThrow({
+      where: { id: room.id },
+      include: { match: true, members: { select: { id: true } } },
+    });
+
+    return { room: serializeRoom(updatedRoom) };
+  });
+
+  app.get("/api/rooms/:code", async (request, reply) => {
+    const user = await requireUser(request);
+    await refreshMatchStatuses();
+    const { code } = request.params as { code: string };
+    const room = await getJoinedRoom(code, user.id);
+    if (!room) return reply.code(404).send({ error: "Room not found or you have not joined it." });
+
+    await ensureRounds(room.match.id);
+
+    const rounds = await prisma.round.findMany({
+      where: { matchId: room.matchId },
+      orderBy: { number: "asc" },
+    });
+    const events = await prisma.event.findMany({
+      where: { matchId: room.matchId },
+      orderBy: { createdAt: "desc" },
+      take: 30,
+    });
+    const myPredictions = await prisma.roomPrediction.findMany({
+      where: { userId: user.id, roomId: room.id },
+      include: { round: true },
+      orderBy: { createdAt: "desc" },
+    });
+    const myState = await prisma.roomUserMatchState.findUnique({
+      where: { userId_roomId: { userId: user.id, roomId: room.id } },
+    });
+
+    return {
+      room: serializeRoom(room),
+      match: serializeMatch(room.match),
+      rounds,
+      activePredictionRound: getPredictionRound(room.match.startTime, rounds),
+      currentRound: getCurrentRound(room.match.startTime, rounds),
+      events: dedupeEvents(events).map((event) => presentEvent(event, room.match)),
+      myPredictions,
+      myState,
+    };
+  });
+
+  app.get("/api/rooms/:code/leaderboard", async (request, reply) => {
+    const user = await requireUser(request);
+    const { code } = request.params as { code: string };
+    const room = await getJoinedRoom(code, user.id);
+    if (!room) return reply.code(404).send({ error: "Room not found or you have not joined it." });
+
+    const rows = await getRoomLeaderboard(room.id);
+    return { leaderboard: rows };
   });
 
   app.post("/api/matches/:id/predictions", async (request, reply) => {
@@ -264,6 +422,62 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
 
     return { prediction, activationDelaySeconds: PREDICTION_ACTIVATION_DELAY_SECONDS };
   });
+
+  app.post("/api/rooms/:code/predictions", async (request, reply) => {
+    const user = await requireUser(request);
+    await refreshMatchStatuses();
+    const { code } = request.params as { code: string };
+    const body = request.body as PredictionBody;
+
+    if (!body.predictionType || !(body.predictionType in PredictionType)) {
+      return reply.code(400).send({ error: "Invalid prediction type." });
+    }
+
+    const room = await getJoinedRoom(code, user.id);
+    if (!room) return reply.code(404).send({ error: "Room not found or you have not joined it." });
+    if (room.match.status !== MatchStatus.OPEN && room.match.status !== MatchStatus.LIVE) {
+      return reply.code(409).send({ error: "Predictions open when the match starts." });
+    }
+
+    await ensureRounds(room.match.id);
+    const rounds = await prisma.round.findMany({ where: { matchId: room.match.id }, orderBy: { number: "asc" } });
+    const round = getPredictionRound(room.match.startTime, rounds);
+
+    if (!round) {
+      return reply.code(409).send({ error: "No prediction round is currently open." });
+    }
+
+    const roundEndsAt = room.match.startTime.getTime() + round.endMinute * 60_000;
+    const now = Date.now();
+    if (roundEndsAt - now <= PREDICTION_CLOSE_BEFORE_ROUND_END_SECONDS * 1000) {
+      return reply.code(409).send({ error: "Predictions are closed for the final 10 seconds of each round." });
+    }
+
+    const existingPrediction = await prisma.roomPrediction.findUnique({
+      where: { userId_roomId_roundId: { userId: user.id, roomId: room.id, roundId: round.id } },
+      select: { id: true, status: true },
+    });
+
+    if (existingPrediction && existingPrediction.status !== PredictionStatus.PENDING) {
+      return reply.code(409).send({ error: "This round has already been resolved." });
+    }
+
+    const effectiveAt = new Date(now + PREDICTION_ACTIVATION_DELAY_SECONDS * 1000);
+    const prediction = await prisma.roomPrediction.upsert({
+      where: { userId_roomId_roundId: { userId: user.id, roomId: room.id, roundId: round.id } },
+      create: {
+        userId: user.id,
+        roomId: room.id,
+        matchId: room.match.id,
+        roundId: round.id,
+        predictionType: body.predictionType,
+        effectiveAt,
+      },
+      update: { predictionType: body.predictionType, effectiveAt },
+    });
+
+    return { prediction, activationDelaySeconds: PREDICTION_ACTIVATION_DELAY_SECONDS };
+  });
 }
 
 function normalizeUsername(username: string | undefined): string {
@@ -296,6 +510,98 @@ function serializeMatch(match: {
   };
 }
 
+function serializeRoom(room: {
+  id: string;
+  code: string;
+  name: string;
+  matchId: string;
+  createdByUserId: string;
+  createdAt: Date;
+  match: Parameters<typeof serializeMatch>[0];
+  members?: Array<{ id: string }>;
+}) {
+  return {
+    id: room.id,
+    code: room.code,
+    name: room.name,
+    matchId: room.matchId,
+    createdByUserId: room.createdByUserId,
+    createdAt: room.createdAt.toISOString(),
+    memberCount: room.members?.length ?? 0,
+    match: serializeMatch(room.match),
+  };
+}
+
+async function getJoinedRoom(code: string, userId: string) {
+  const roomCode = normalizeRoomCode(code);
+  if (!roomCode) return null;
+
+  return prisma.room.findFirst({
+    where: {
+      code: roomCode,
+      members: { some: { userId } },
+    },
+    include: {
+      match: true,
+      members: { select: { id: true } },
+    },
+  });
+}
+
+async function getRoomLeaderboard(roomId: string) {
+  const room = await prisma.room.findUniqueOrThrow({
+    where: { id: roomId },
+    include: {
+      members: {
+        include: {
+          user: { select: { id: true, username: true } },
+        },
+      },
+    },
+  });
+  const states = await prisma.roomUserMatchState.findMany({
+    where: { roomId },
+  });
+  const stateByUserId = new Map(states.map((state) => [state.userId, state]));
+
+  return room.members
+    .map((member) => {
+      const state = stateByUserId.get(member.userId);
+      return {
+        username: member.user.username,
+        score: state?.score ?? 0,
+        streak: state?.streak ?? 0,
+        joinedAt: member.joinedAt,
+      };
+    })
+    .sort((a, b) => b.score - a.score || a.joinedAt.getTime() - b.joinedAt.getTime() || a.username.localeCompare(b.username))
+    .slice(0, 50)
+    .map((row, index) => ({
+      rank: index + 1,
+      username: row.username,
+      score: row.score,
+      streak: row.streak,
+    }));
+}
+
+async function generateRoomCode(): Promise<string> {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const code = Array.from({ length: 6 }, () => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[Math.floor(Math.random() * 32)]).join("");
+    const existing = await prisma.room.findUnique({ where: { code }, select: { id: true } });
+    if (!existing) return code;
+  }
+
+  throw new Error("Unable to generate a unique room code.");
+}
+
+function normalizeRoomCode(code: string | undefined): string {
+  return (code || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function normalizeRoomName(name: string | undefined): string {
+  return (name || "").trim().slice(0, 48);
+}
+
 function dedupeEvents(events: Event[]): Event[] {
   const accepted: Event[] = [];
 
@@ -322,6 +628,8 @@ function getPredictionRound(startTime: Date, rounds: Array<{ id: string; number:
   if (now < kickoff) return null;
 
   const elapsedMinute = Math.floor((now - kickoff) / 60_000);
+  if (elapsedMinute >= MATCH_DURATION_MINUTES) return null;
+
   const currentRoundNumber = Math.floor(elapsedMinute / ROUND_LENGTH_MINUTES) + 1;
   return rounds.find((round) => round.number === currentRoundNumber) ?? null;
 }
@@ -333,6 +641,8 @@ function getCurrentRound(startTime: Date, rounds: Array<{ id: string; number: nu
   if (now < kickoff) return null;
 
   const elapsedMinute = Math.floor((now - kickoff) / 60_000);
+  if (elapsedMinute >= MATCH_DURATION_MINUTES) return null;
+
   const currentRoundNumber = Math.floor(elapsedMinute / ROUND_LENGTH_MINUTES) + 1;
   return rounds.find((round) => round.number === currentRoundNumber) ?? null;
 }

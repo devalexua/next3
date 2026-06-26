@@ -119,6 +119,7 @@ export type ResolvedPrediction = {
   userId: string;
   matchId: string;
   roundId: string;
+  roomId?: string;
   status: PredictionStatus;
   pointsAwarded: number;
   score: number;
@@ -178,6 +179,56 @@ async function awardWinningPredictions(
       userId: prediction.userId,
       matchId,
       roundId,
+      status: PredictionStatus.WON,
+      pointsAwarded: points,
+      score: state.score + points,
+      streak: nextStreak,
+    });
+  }
+
+  const roomPredictions = await prisma.roomPrediction.findMany({
+    where: {
+      matchId,
+      roundId,
+      predictionType,
+      status: PredictionStatus.PENDING,
+      effectiveAt: { lte: eventCreatedAt },
+    },
+  });
+
+  for (const prediction of roomPredictions) {
+    const state = await prisma.roomUserMatchState.upsert({
+      where: { userId_roomId: { userId: prediction.userId, roomId: prediction.roomId } },
+      create: { userId: prediction.userId, roomId: prediction.roomId, matchId, score: 0, streak: 0 },
+      update: {},
+    });
+
+    const nextStreak = state.streak + 1;
+    const points = basePoints[prediction.predictionType] * multiplierForStreak(nextStreak);
+
+    await prisma.$transaction([
+      prisma.roomPrediction.update({
+        where: { id: prediction.id },
+        data: {
+          status: PredictionStatus.WON,
+          pointsAwarded: points,
+        },
+      }),
+      prisma.roomUserMatchState.update({
+        where: { id: state.id },
+        data: {
+          score: state.score + points,
+          streak: nextStreak,
+        },
+      }),
+    ]);
+
+    wonPredictions.push({
+      predictionId: prediction.id,
+      userId: prediction.userId,
+      matchId,
+      roundId,
+      roomId: prediction.roomId,
       status: PredictionStatus.WON,
       pointsAwarded: points,
       score: state.score + points,
@@ -247,6 +298,50 @@ async function resolveRoundMisses(
       prisma.userMatchState.upsert({
         where: { userId_matchId: { userId: prediction.userId, matchId: match.id } },
         create: { userId: prediction.userId, matchId: match.id, score: 0, streak: 0 },
+        update: { streak: 0 },
+      }),
+    ]);
+  }
+
+  const pendingRoomPredictions = await prisma.roomPrediction.findMany({
+    where: {
+      matchId: match.id,
+      roundId,
+      status: PredictionStatus.PENDING,
+    },
+  });
+
+  for (const prediction of pendingRoomPredictions) {
+    if (prediction.predictionType === PredictionType.NOTHING_HAPPENS && !hasScoringEvent) {
+      const state = await prisma.roomUserMatchState.upsert({
+        where: { userId_roomId: { userId: prediction.userId, roomId: prediction.roomId } },
+        create: { userId: prediction.userId, roomId: prediction.roomId, matchId: match.id, score: 0, streak: 0 },
+        update: {},
+      });
+      const nextStreak = state.streak + 1;
+      const points = basePoints.NOTHING_HAPPENS * multiplierForStreak(nextStreak);
+
+      await prisma.$transaction([
+        prisma.roomPrediction.update({
+          where: { id: prediction.id },
+          data: { status: PredictionStatus.WON, pointsAwarded: points },
+        }),
+        prisma.roomUserMatchState.update({
+          where: { id: state.id },
+          data: { score: state.score + points, streak: nextStreak },
+        }),
+      ]);
+      continue;
+    }
+
+    await prisma.$transaction([
+      prisma.roomPrediction.update({
+        where: { id: prediction.id },
+        data: { status: PredictionStatus.LOST, pointsAwarded: 0 },
+      }),
+      prisma.roomUserMatchState.upsert({
+        where: { userId_roomId: { userId: prediction.userId, roomId: prediction.roomId } },
+        create: { userId: prediction.userId, roomId: prediction.roomId, matchId: match.id, score: 0, streak: 0 },
         update: { streak: 0 },
       }),
     ]);

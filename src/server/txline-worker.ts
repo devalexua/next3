@@ -117,11 +117,15 @@ async function streamScores(
           io.emit("streak_updated", {
             userId: prediction.userId,
             matchId: prediction.matchId,
+            roomId: prediction.roomId,
             streak: prediction.streak,
             score: prediction.score,
           });
+          if (prediction.roomId) {
+            io.emit("leaderboard_updated", { matchId: prediction.matchId, roomId: prediction.roomId, at: new Date().toISOString() });
+          }
         }
-        if (wonPredictions.length > 0) {
+        if (wonPredictions.some((prediction) => !prediction.roomId)) {
           io.emit("leaderboard_updated", { matchId: event.matchId, at: new Date().toISOString() });
         }
       }

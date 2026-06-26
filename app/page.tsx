@@ -4,11 +4,15 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowLeft,
   Clock,
+  Copy,
   Flame,
   LogOut,
+  Play,
+  Plus,
   ShieldCheck,
   Sparkles,
   Trophy,
+  Users,
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -87,6 +91,21 @@ type MatchDetail = {
   myState: { score: number; streak: number } | null;
 };
 
+type Room = {
+  id: string;
+  code: string;
+  name: string;
+  matchId: string;
+  createdByUserId: string;
+  createdAt: string;
+  memberCount: number;
+  match: Match;
+};
+
+type RoomDetail = MatchDetail & {
+  room: Room;
+};
+
 type LeaderboardRow = {
   rank: number;
   username: string;
@@ -102,7 +121,11 @@ type TestGameStatus = {
   minute: number;
 };
 
+type MatchPanelTab = "feed" | "leaderboard" | "rounds";
+type HomeTab = "games" | "rooms" | "leaderboard";
+
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
+const matchDurationMinutes = 90;
 
 const predictionOptions: Array<{ label: string; value: PredictionType; points: number; icon: string; tone: string }> = [
   { label: "Goal", value: "GOAL", points: 7, icon: "⚽", tone: "from-lime-300 to-emerald-400" },
@@ -116,13 +139,22 @@ const predictionOptions: Array<{ label: string; value: PredictionType; points: n
 export default function Home() {
   const [user, setUser] = useState<User | null>(null);
   const [matches, setMatches] = useState<Match[]>([]);
+  const [rooms, setRooms] = useState<Room[]>([]);
   const [selectedMatchId, setSelectedMatchId] = useState<string | null>(null);
+  const [selectedRoomCode, setSelectedRoomCode] = useState<string | null>(null);
   const [detail, setDetail] = useState<MatchDetail | null>(null);
+  const [roomDetail, setRoomDetail] = useState<RoomDetail | null>(null);
   const [matchLeaderboard, setMatchLeaderboard] = useState<LeaderboardRow[]>([]);
+  const [roomLeaderboard, setRoomLeaderboard] = useState<LeaderboardRow[]>([]);
   const [globalLeaderboard, setGlobalLeaderboard] = useState<LeaderboardRow[]>([]);
+  const [globalCurrentUserRank, setGlobalCurrentUserRank] = useState<LeaderboardRow | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [homeTab, setHomeTab] = useState<HomeTab>("games");
+  const [showIntro, setShowIntro] = useState(true);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [joinRoomCode, setJoinRoomCode] = useState("");
+  const [roomMessage, setRoomMessage] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [liveBanner, setLiveBanner] = useState<EventRecord | null>(null);
@@ -144,9 +176,19 @@ export default function Home() {
   }, []);
 
   const loadGlobalLeaderboard = useCallback(() => {
-    fetch(`${apiUrl}/api/leaderboard`)
+    fetch(`${apiUrl}/api/leaderboard`, { credentials: "include" })
       .then((response) => response.json())
-      .then((data) => setGlobalLeaderboard(data.leaderboard ?? []))
+      .then((data) => {
+        setGlobalLeaderboard(data.leaderboard ?? []);
+        setGlobalCurrentUserRank(data.currentUserRank ?? null);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const loadRooms = useCallback(() => {
+    fetch(`${apiUrl}/api/rooms`, { credentials: "include" })
+      .then((response) => response.ok ? response.json() : { rooms: [] })
+      .then((data) => setRooms(data.rooms ?? []))
       .catch(() => undefined);
   }, []);
 
@@ -169,6 +211,18 @@ export default function Home() {
       .catch(() => undefined);
   }, []);
 
+  const loadRoomDetail = useCallback((code: string) => {
+    fetch(`${apiUrl}/api/rooms/${code}`, { credentials: "include" })
+      .then((response) => response.json())
+      .then((data) => setRoomDetail(data))
+      .catch(() => undefined);
+
+    fetch(`${apiUrl}/api/rooms/${code}/leaderboard`, { credentials: "include" })
+      .then((response) => response.json())
+      .then((data) => setRoomLeaderboard(data.leaderboard ?? []))
+      .catch(() => undefined);
+  }, []);
+
   useEffect(() => {
     fetch(`${apiUrl}/api/me`, { credentials: "include" })
       .then((response) => response.json())
@@ -184,6 +238,13 @@ export default function Home() {
 
     return () => clearInterval(interval);
   }, [loadGlobalLeaderboard, loadMatches]);
+
+  useEffect(() => {
+    if (!user) return;
+    loadRooms();
+    const interval = setInterval(loadRooms, 30_000);
+    return () => clearInterval(interval);
+  }, [loadRooms, user]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -212,49 +273,86 @@ export default function Home() {
   }, [loadMatchDetail, selectedMatchId]);
 
   useEffect(() => {
+    if (!selectedRoomCode) return;
+
+    loadRoomDetail(selectedRoomCode);
+    const interval = setInterval(() => loadRoomDetail(selectedRoomCode), 10_000);
+    return () => clearInterval(interval);
+  }, [loadRoomDetail, selectedRoomCode]);
+
+  const selectedRoom = selectedRoomCode
+    ? roomDetail?.room ?? rooms.find((room) => room.code === selectedRoomCode) ?? null
+    : null;
+  const openMatchId = selectedRoom?.matchId ?? selectedMatchId;
+  const openRoomId = selectedRoom?.id ?? null;
+  const activeTimelineEvents = selectedRoomCode ? roomDetail?.events : detail?.events;
+
+  const showEventBanner = useCallback((event: EventRecord) => {
+    if (event.eventType === "UNKNOWN") return;
+    if (!shouldShowEventNotification(event, shownEventNotificationsRef.current)) return;
+
+    setLiveBanner(event);
+    window.setTimeout(() => setLiveBanner(null), 3200);
+  }, []);
+
+  useEffect(() => {
+    if (!openMatchId || !activeTimelineEvents?.length) return;
+
+    const latestEvent = activeTimelineEvents[0];
+    if (!latestEvent || latestEvent.matchId !== openMatchId) return;
+
+    const eventAgeMs = Date.now() - new Date(latestEvent.createdAt).getTime();
+    if (eventAgeMs > 15_000) return;
+
+    showEventBanner(latestEvent);
+  }, [activeTimelineEvents, openMatchId, showEventBanner]);
+
+  useEffect(() => {
     const socket = io(apiUrl, { withCredentials: true, transports: ["websocket", "polling"] });
     socketRef.current = socket;
 
     socket.on("event_created", (event: EventRecord) => {
       const shouldNotifyForOpenMatch =
-        selectedMatchId !== null &&
-        event.matchId === selectedMatchId &&
-        event.eventType !== "UNKNOWN" &&
-        shouldShowEventNotification(event, shownEventNotificationsRef.current);
+        openMatchId !== null &&
+        event.matchId === openMatchId &&
+        event.eventType !== "UNKNOWN";
 
       if (shouldNotifyForOpenMatch) {
-        setLiveBanner(event);
-        window.setTimeout(() => setLiveBanner(null), 3200);
+        showEventBanner(event);
       }
 
       if (event.simulated) {
         if (!showAdminTest) return;
-        if (event.matchId === selectedMatchId) {
+        if (event.matchId === openMatchId) {
           setSimulatedEvents((current) => [event, ...current].slice(0, 30));
         }
         return;
       }
 
-      if (event.matchId === selectedMatchId) {
+      if (selectedRoomCode && event.matchId === openMatchId) {
+        loadRoomDetail(selectedRoomCode);
+      } else if (event.matchId === selectedMatchId) {
         loadMatchDetail(event.matchId);
       }
     });
 
-    socket.on("prediction_won", (payload: { predictionId: string; userId: string; matchId: string; pointsAwarded: number; streak: number; event: EventRecord }) => {
+    socket.on("prediction_won", (payload: { predictionId: string; userId: string; matchId: string; roomId?: string; pointsAwarded: number; streak: number; event: EventRecord }) => {
       if (payload.userId !== user?.id) return;
-      if (payload.matchId !== selectedMatchId) return;
+      if (openRoomId ? payload.roomId !== openRoomId : payload.roomId || payload.matchId !== selectedMatchId) return;
       if (shownPredictionWinsRef.current.has(payload.predictionId)) return;
 
       shownPredictionWinsRef.current.add(payload.predictionId);
       setNotice(`Correct! +${formatScore(payload.pointsAwarded)} points`);
       if (payload.event.eventType === "GOAL" || payload.streak >= 5) triggerConfetti(setConfetti);
-      loadMatchDetail(payload.matchId);
+      if (selectedRoomCode) loadRoomDetail(selectedRoomCode);
+      else loadMatchDetail(payload.matchId);
       window.setTimeout(() => setNotice(""), 3600);
     });
 
-    socket.on("leaderboard_updated", (payload: { matchId?: string }) => {
+    socket.on("leaderboard_updated", (payload: { matchId?: string; roomId?: string }) => {
       loadGlobalLeaderboard();
-      if (payload.matchId && payload.matchId === selectedMatchId) loadMatchDetail(payload.matchId);
+      if (openRoomId && payload.roomId === openRoomId && selectedRoomCode) loadRoomDetail(selectedRoomCode);
+      else if (!openRoomId && payload.matchId && payload.matchId === selectedMatchId) loadMatchDetail(payload.matchId);
     });
 
     socket.on("match_score_updated", (payload: { matchId: string; homeScore: number; awayScore: number }) => {
@@ -271,10 +369,19 @@ export default function Home() {
             : current,
         );
       }
+      if (selectedRoomCode && payload.matchId === openMatchId) {
+        setRoomDetail((current) =>
+          current
+            ? { ...current, match: { ...current.match, homeScore: payload.homeScore, awayScore: payload.awayScore } }
+            : current,
+        );
+      }
     });
 
     socket.on("round_finished", (payload: { matchId?: string }) => {
-      if (selectedMatchId && (!payload.matchId || payload.matchId === selectedMatchId)) {
+      if (selectedRoomCode && (!payload.matchId || payload.matchId === openMatchId)) {
+        loadRoomDetail(selectedRoomCode);
+      } else if (selectedMatchId && (!payload.matchId || payload.matchId === selectedMatchId)) {
         loadMatchDetail(selectedMatchId);
       }
     });
@@ -289,9 +396,11 @@ export default function Home() {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [loadGlobalLeaderboard, loadMatchDetail, selectedMatchId, showAdminTest, user?.id]);
+  }, [loadGlobalLeaderboard, loadMatchDetail, loadRoomDetail, openMatchId, openRoomId, selectedMatchId, selectedRoomCode, showAdminTest, showEventBanner, user?.id]);
 
-  const selectedMatch = selectedMatchId ? matches.find((match) => match.id === selectedMatchId) ?? detail?.match ?? null : null;
+  const selectedMatch = selectedRoom
+    ? selectedRoom.match
+    : selectedMatchId ? matches.find((match) => match.id === selectedMatchId) ?? detail?.match ?? null : null;
 
   async function submitAuth(event: React.FormEvent) {
     event.preventDefault();
@@ -311,13 +420,70 @@ export default function Home() {
     }
 
     setUser(data.user);
+    loadRooms();
     if (selectedMatchId) loadMatchDetail(selectedMatchId);
   }
 
   async function logout() {
     await fetch(`${apiUrl}/api/auth/logout`, { method: "POST", credentials: "include" });
     setUser(null);
+    setHomeTab("games");
+    setRooms([]);
+    setSelectedRoomCode(null);
+    setRoomDetail(null);
+    setRoomLeaderboard([]);
     setDetail((current) => current ? { ...current, myPredictions: [], myState: null } : current);
+  }
+
+  async function createRoom(matchId: string) {
+    if (!user) {
+      setNotice("Log in to create rooms.");
+      window.setTimeout(() => setNotice(""), 2600);
+      return;
+    }
+
+    const response = await fetch(`${apiUrl}/api/rooms`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ matchId }),
+    });
+    const data = await response.json();
+
+    if (!response.ok) {
+      setNotice(data.error || "Room creation failed.");
+      window.setTimeout(() => setNotice(""), 3000);
+      return;
+    }
+
+    setRooms((current) => [data.room, ...current.filter((room) => room.id !== data.room.id)]);
+    setSelectedRoomCode(data.room.code);
+    setSelectedMatchId(null);
+    setNotice(`Room ${data.room.code} created`);
+    window.setTimeout(() => setNotice(""), 2600);
+  }
+
+  async function joinRoom(event: React.FormEvent) {
+    event.preventDefault();
+    setRoomMessage("");
+
+    const response = await fetch(`${apiUrl}/api/rooms/join`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: joinRoomCode }),
+    });
+    const data = await response.json();
+
+    if (!response.ok) {
+      setRoomMessage(data.error || "Could not join room.");
+      return;
+    }
+
+    setJoinRoomCode("");
+    setRooms((current) => [data.room, ...current.filter((room) => room.id !== data.room.id)]);
+    setSelectedRoomCode(data.room.code);
+    setSelectedMatchId(null);
   }
 
   return (
@@ -325,17 +491,23 @@ export default function Home() {
       <div className="stadium-lights" aria-hidden="true" />
       <LiveOverlays event={liveBanner} notice={notice} confetti={confetti} />
 
-      {selectedMatch ? (
+      {showIntro ? (
+        <IntroScreen onContinue={() => setShowIntro(false)} />
+      ) : selectedMatch ? (
         <MatchExperience
-          detail={detail}
+          detail={selectedRoom ? roomDetail : detail}
           fallbackMatch={selectedMatch}
-          leaderboard={matchLeaderboard}
+          room={selectedRoom}
+          leaderboard={selectedRoom ? roomLeaderboard : matchLeaderboard}
           user={user}
           now={now}
           onBack={() => {
             setSelectedMatchId(null);
+            setSelectedRoomCode(null);
             setDetail(null);
+            setRoomDetail(null);
             setMatchLeaderboard([]);
+            setRoomLeaderboard([]);
             setSimulatedEvents([]);
           }}
           adminToken={adminToken}
@@ -351,7 +523,7 @@ export default function Home() {
               return;
             }
 
-            const response = await fetch(`${apiUrl}/api/matches/${selectedMatch.id}/predictions`, {
+            const response = await fetch(selectedRoom ? `${apiUrl}/api/rooms/${selectedRoom.code}/predictions` : `${apiUrl}/api/matches/${selectedMatch.id}/predictions`, {
               method: "POST",
               credentials: "include",
               headers: { "Content-Type": "application/json" },
@@ -365,7 +537,8 @@ export default function Home() {
             }
 
             setNotice(`${formatPrediction(data.prediction.predictionType)} saved for this round`);
-            loadMatchDetail(selectedMatch.id);
+            if (selectedRoom) loadRoomDetail(selectedRoom.code);
+            else loadMatchDetail(selectedMatch.id);
             window.setTimeout(() => setNotice(""), 2600);
           }}
         />
@@ -386,11 +559,134 @@ export default function Home() {
           ) : (
             <UserStrip user={user} />
           )}
-          <MatchList matches={matches} now={now} onSelect={setSelectedMatchId} />
-          <GlobalLeaderboard rows={globalLeaderboard} />
+          <HomeTabs
+            activeTab={homeTab}
+            setActiveTab={setHomeTab}
+            roomsCount={rooms.length}
+            leadersCount={globalLeaderboard.length}
+            showRooms={Boolean(user)}
+          />
+          <AnimatePresence mode="wait" initial={false}>
+            {homeTab === "games" ? (
+              <motion.div key="games" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
+                <MatchList
+                  matches={matches}
+                  now={now}
+                  user={user}
+                  onSelect={(id) => {
+                    setSelectedMatchId(id);
+                    setSelectedRoomCode(null);
+                  }}
+                  onCreateRoom={createRoom}
+                />
+              </motion.div>
+            ) : null}
+            {homeTab === "rooms" && user ? (
+              <motion.div key="rooms" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
+                <RoomsPanel
+                  rooms={rooms}
+                  code={joinRoomCode}
+                  message={roomMessage}
+                  setCode={setJoinRoomCode}
+                  onJoin={joinRoom}
+                  onOpen={(code) => {
+                    setSelectedRoomCode(code);
+                    setSelectedMatchId(null);
+                  }}
+                />
+              </motion.div>
+            ) : null}
+            {homeTab === "leaderboard" ? (
+              <motion.div key="leaderboard" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
+                <GlobalLeaderboard rows={globalLeaderboard} currentUserRank={globalCurrentUserRank} user={user} />
+              </motion.div>
+            ) : null}
+          </AnimatePresence>
         </>
       )}
     </main>
+  );
+}
+
+function IntroScreen({ onContinue }: { onContinue: () => void }) {
+  return (
+    <section className="flex min-h-[calc(100vh-2.5rem)] flex-col justify-center">
+      <div className="relative overflow-hidden rounded-lg border border-lime-300/25 bg-black/35 p-5 shadow-2xl shadow-lime-950/30">
+        <div className="score-sweep" aria-hidden="true" />
+        <div className="relative">
+          <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-lime-300/25 bg-lime-300/10 px-3 py-1 text-xs font-black uppercase tracking-normal text-lime-100">
+            <Zap size={15} />
+            Next3
+          </div>
+          <h1 className="text-5xl font-black leading-none tracking-normal text-white">World Cup Rush</h1>
+          <p className="mt-4 text-lg font-semibold leading-snug text-white/78">
+            Predict what happens next in live World Cup matches.
+          </p>
+          <p className="mt-3 text-sm leading-relaxed text-white/58">
+            Inspired by fast prediction markets, Next3 turns every match into 3-minute rounds where fans compete on goals, cards, corners, substitutions, or quiet stretches. Powered by TxLINE live football data.
+          </p>
+
+          <div className="mt-6 grid grid-cols-3 gap-2">
+            <IntroStat label="Round" value="3 min" />
+            <IntroStat label="Source" value="TxLINE" />
+            <IntroStat label="Mode" value="No betting" />
+          </div>
+
+          <button
+            onClick={onContinue}
+            className="mt-6 flex h-13 w-full items-center justify-center gap-2 rounded-md bg-lime-300 text-base font-black text-black shadow-lg shadow-lime-300/20"
+          >
+            <Play size={18} fill="currentColor" />
+            Enter Game
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function IntroStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-md border border-white/10 bg-white/[0.06] p-3 text-center">
+      <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-white/38">{label}</div>
+      <div className="mt-1 text-sm font-black text-white">{value}</div>
+    </div>
+  );
+}
+
+function HomeTabs(props: {
+  activeTab: HomeTab;
+  setActiveTab: (tab: HomeTab) => void;
+  roomsCount: number;
+  leadersCount: number;
+  showRooms: boolean;
+}) {
+  const tabs: Array<{ value: HomeTab; label: string; count?: number }> = props.showRooms
+    ? [
+        { value: "games", label: "Games" },
+        { value: "rooms", label: "Rooms", count: props.roomsCount },
+        { value: "leaderboard", label: "Leaders", count: props.leadersCount },
+      ]
+    : [
+        { value: "games", label: "Games" },
+        { value: "leaderboard", label: "Leaders", count: props.leadersCount },
+      ];
+
+  return (
+    <nav className={`mb-5 grid gap-1 rounded-md bg-black/30 p-1 ${tabs.length === 3 ? "grid-cols-3" : "grid-cols-2"}`}>
+      {tabs.map((tab) => (
+        <button
+          key={tab.value}
+          onClick={() => props.setActiveTab(tab.value)}
+          className={`h-10 rounded text-xs font-black transition ${props.activeTab === tab.value ? "bg-lime-300 text-black" : "text-white/60 hover:bg-white/8 hover:text-white"}`}
+        >
+          {tab.label}
+          {tab.count !== undefined ? (
+            <span className={props.activeTab === tab.value ? "ml-1 text-black/55" : "ml-1 text-white/35"}>{tab.count}</span>
+          ) : null}
+        </button>
+      ))}
+    </nav>
   );
 }
 
@@ -465,7 +761,62 @@ function UserStrip({ user }: { user: User }) {
   );
 }
 
-function MatchList({ matches, now, onSelect }: { matches: Match[]; now: number; onSelect: (id: string) => void }) {
+function RoomsPanel(props: {
+  rooms: Room[];
+  code: string;
+  message: string;
+  setCode: (value: string) => void;
+  onJoin: (event: React.FormEvent) => void;
+  onOpen: (code: string) => void;
+}) {
+  return (
+    <section className="mb-6 rounded-lg border border-sky-300/20 bg-sky-300/10 p-4">
+      <div className="mb-3 flex items-center gap-2">
+        <Users className="text-sky-200" size={18} />
+        <h2 className="font-semibold text-white">Friend Rooms</h2>
+      </div>
+      <form onSubmit={props.onJoin} className="mb-3 flex gap-2">
+        <input
+          value={props.code}
+          onChange={(event) => props.setCode(event.target.value.toUpperCase())}
+          placeholder="Room code"
+          className="h-11 min-w-0 flex-1 rounded-md border border-white/10 bg-black/30 px-3 text-sm font-semibold uppercase tracking-[0.12em] text-white outline-none focus:border-sky-300"
+        />
+        <button className="h-11 rounded-md bg-sky-300 px-4 text-sm font-black text-black">Join</button>
+      </form>
+      {props.message ? <div className="mb-3 text-sm text-red-200">{props.message}</div> : null}
+      <div className="space-y-2">
+        {props.rooms.slice(0, 3).map((room) => (
+          <button
+            key={room.id}
+            onClick={() => props.onOpen(room.code)}
+            className="flex w-full items-center justify-between gap-3 rounded-md border border-white/10 bg-black/25 px-3 py-2 text-left"
+          >
+            <div className="min-w-0">
+              <div className="truncate text-sm font-semibold text-white">{room.name}</div>
+              <div className="text-xs text-white/45">{room.memberCount} players · {room.match.homeTeam} vs {room.match.awayTeam}</div>
+            </div>
+            <div className="rounded bg-white/10 px-2 py-1 text-xs font-black text-sky-100">{room.code}</div>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MatchList({
+  matches,
+  now,
+  user,
+  onSelect,
+  onCreateRoom,
+}: {
+  matches: Match[];
+  now: number;
+  user: User | null;
+  onSelect: (id: string) => void;
+  onCreateRoom: (id: string) => void;
+}) {
   const nextMatches = useMemo(() => matches.slice(0, 12), [matches]);
 
   return (
@@ -476,35 +827,52 @@ function MatchList({ matches, now, onSelect }: { matches: Match[]; now: number; 
       </div>
       <div className="space-y-3">
         {nextMatches.map((match, index) => (
-          <motion.button
+          <motion.div
             key={match.id}
-            onClick={() => onSelect(match.id)}
             className="match-card group relative w-full overflow-hidden rounded-lg border border-white/10 bg-white/[0.07] p-4 text-left shadow-lg shadow-black/10"
             initial={{ opacity: 0, y: 16, scale: 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             transition={{ delay: index * 0.035, duration: 0.28 }}
-            whileTap={{ scale: 0.98 }}
           >
             <div className="match-card-stripe" aria-hidden="true" />
-            <div className="mb-3 flex items-center justify-between">
-              <span className={`rounded px-2 py-1 text-xs font-semibold ${statusClass(match.status)}`}>{match.status}</span>
-              <span className="text-xs text-white/50">#{match.txlineFixtureId}</span>
-            </div>
-            <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
-              <TeamName name={match.homeTeam} align="right" />
-              <MatchScore match={match} compact />
-              <TeamName name={match.awayTeam} align="left" />
-            </div>
-            <div className="mt-4 flex items-center justify-between gap-3 text-sm">
-              <div className="flex min-w-0 items-center gap-2 text-white/65">
-                <Clock size={16} />
-                <span className="truncate">{new Date(match.startTime).toLocaleString()}</span>
+            <button onClick={() => onSelect(match.id)} className="relative block w-full text-left">
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <span className={`rounded px-2 py-1 text-xs font-semibold ${statusClass(match.status)}`}>{match.status}</span>
+                <span className="text-xs text-white/50">#{match.txlineFixtureId}</span>
               </div>
-              <span className={now >= new Date(match.opensAt).getTime() ? "text-lime-200" : "text-white/70"}>
-                {now >= new Date(match.opensAt).getTime() ? "Open" : formatDuration(new Date(match.startTime).getTime() - now)}
-              </span>
-            </div>
-          </motion.button>
+              <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
+                <TeamName name={match.homeTeam} align="right" />
+                <MatchScore match={match} compact />
+                <TeamName name={match.awayTeam} align="left" />
+              </div>
+              <div className="mt-4 flex items-center justify-between gap-3 text-sm">
+                <div className="flex min-w-0 items-center gap-2 text-white/65">
+                  <Clock size={16} />
+                  <span className="truncate">{new Date(match.startTime).toLocaleString()}</span>
+                </div>
+                <span className={now >= new Date(match.opensAt).getTime() ? "text-lime-200" : "text-white/70"}>
+                  {now >= new Date(match.opensAt).getTime() ? "Open" : formatDuration(new Date(match.startTime).getTime() - now)}
+                </span>
+              </div>
+            </button>
+            {user ? (
+              <div className="relative mt-3 border-t border-white/10 pt-3">
+                <button
+                  onClick={() => onCreateRoom(match.id)}
+                  className="flex w-full items-center justify-between rounded-md bg-black/20 px-3 py-2 text-left transition hover:bg-white/8"
+                >
+                  <span className="flex items-center gap-2 text-xs font-semibold text-white/65">
+                    <Users size={14} className="text-sky-200" />
+                    Friends only
+                  </span>
+                  <span className="inline-flex items-center gap-1 rounded bg-sky-300/15 px-2 py-1 text-xs font-black text-sky-100">
+                    <Plus size={12} />
+                    Create
+                  </span>
+                </button>
+              </div>
+            ) : null}
+          </motion.div>
         ))}
       </div>
     </section>
@@ -514,6 +882,7 @@ function MatchList({ matches, now, onSelect }: { matches: Match[]; now: number; 
 function MatchExperience(props: {
   detail: MatchDetail | null;
   fallbackMatch: Match;
+  room?: Room | null;
   leaderboard: LeaderboardRow[];
   user: User | null;
   now: number;
@@ -526,17 +895,31 @@ function MatchExperience(props: {
   onRefreshTestGameStatus: () => void;
   onSubmit: (predictionType: PredictionType) => Promise<void>;
 }) {
+  const [activeTab, setActiveTab] = useState<MatchPanelTab>("feed");
   const match = props.detail?.match ?? props.fallbackMatch;
   const predictionRound = props.detail?.activePredictionRound ?? null;
   const currentRound = props.detail?.currentRound ?? null;
   const myState = props.detail?.myState ?? { score: 0, streak: 0 };
   const selectedPrediction = props.detail?.myPredictions.find((prediction) => prediction.roundId === predictionRound?.id);
+  const elapsedMs = props.now - new Date(match.startTime).getTime();
+  const fullTime = match.status === "FINISHED" || elapsedMs >= matchDurationMinutes * 60_000;
   const lockAt = predictionRound ? new Date(match.startTime).getTime() + predictionRound.endMinute * 60_000 : null;
   const timeToLock = lockAt ? lockAt - props.now : null;
   const finalSeconds = timeToLock !== null && timeToLock > 0 && timeToLock <= 10_000;
   const predictionsClosed = !predictionRound || finalSeconds || (timeToLock !== null && timeToLock <= 0);
 
+  const recentPredictions = props.detail?.myPredictions ?? [];
   const visibleEvents = dedupeTimelineEvents([...props.simulatedEvents, ...(props.detail?.events ?? [])]).slice(0, 30);
+  const tabCounts: Record<MatchPanelTab, number> = {
+    feed: visibleEvents.length,
+    leaderboard: props.leaderboard.length,
+    rounds: recentPredictions.length,
+  };
+  const leader = props.leaderboard[0];
+
+  useEffect(() => {
+    if (fullTime) setActiveTab("leaderboard");
+  }, [fullTime]);
 
   return (
     <section className="pb-6">
@@ -545,12 +928,14 @@ function MatchExperience(props: {
         Matches
       </button>
 
+      {props.room ? <RoomHeader room={props.room} /> : null}
+
       <div className="match-stage mb-4 overflow-hidden rounded-lg border border-white/10 bg-black/30">
         <div className="relative border-b border-white/10 bg-white/[0.06] p-4">
           <div className="pulse-ring" aria-hidden="true" />
           <div className="mb-2 flex items-center justify-between">
             <span className={`rounded px-2 py-1 text-xs font-semibold ${statusClass(match.status)}`}>{match.status}</span>
-            <span className="text-xs text-white/50">TxLINE #{match.txlineFixtureId}</span>
+            <span className="text-xs text-white/50">{props.room ? `Room ${props.room.code}` : `TxLINE #${match.txlineFixtureId}`}</span>
           </div>
           <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
             <TeamName name={match.homeTeam} align="right" />
@@ -562,65 +947,123 @@ function MatchExperience(props: {
         <div className="grid grid-cols-3 divide-x divide-white/10">
           <Stat label="Score" value={formatScore(myState.score)} />
           <Stat label="Streak" value={`x${formatMultiplier(myState.streak)}`} active={myState.streak >= 3} />
-          <Stat label="Round" value={currentRound ? `${currentRound.startMinute}-${currentRound.endMinute}` : "Pre"} />
+          <Stat label="Round" value={fullTime ? "FT" : currentRound ? `${currentRound.startMinute}-${currentRound.endMinute}` : "Pre"} />
         </div>
       </div>
 
-      <section className={`mb-4 rounded-lg border p-4 ${finalSeconds ? "animate-pulse border-red-300/60 bg-red-400/10" : "border-lime-300/20 bg-lime-300/10"}`}>
-        <div className="mb-2 flex items-center justify-between">
-          <div className="text-sm font-medium text-lime-100">Current Prediction Round</div>
-          <div className="text-sm text-white/60">{predictionRound ? `${predictionRound.startMinute}' - ${predictionRound.endMinute}'` : "Closed"}</div>
-        </div>
-        <div className="flex items-end justify-between">
+      {fullTime ? (
+        <section className="mb-5 rounded-lg border border-lime-300/30 bg-lime-300/10 p-4 text-center">
+          <div className="text-xs font-black uppercase tracking-[0.2em] text-lime-200">Full Time</div>
+          <div className="mt-2 text-2xl font-black text-white">Final Leaderboard</div>
+          <div className="mt-1 text-sm text-white/55">Predictions are closed after 90 minutes.</div>
+        </section>
+      ) : (
+        <>
+          <section className={`mb-4 rounded-lg border p-4 ${finalSeconds ? "animate-pulse border-red-300/60 bg-red-400/10" : "border-lime-300/20 bg-lime-300/10"}`}>
+            <div className="mb-2 flex items-center justify-between">
+              <div className="text-sm font-medium text-lime-100">Current Prediction Round</div>
+              <div className="text-sm text-white/60">{predictionRound ? `${predictionRound.startMinute}' - ${predictionRound.endMinute}'` : "Closed"}</div>
+            </div>
+            <div className="flex items-end justify-between">
+              <div>
+                <div className="text-4xl font-semibold text-white">{timeToLock !== null ? formatDuration(timeToLock) : "--:--"}</div>
+                <div className="mt-1 text-sm text-white/60">
+                  {predictionRound ? (predictionsClosed ? "Predictions closed for this round" : "Predictions activate after 10 seconds") : "No prediction round is open"}
+                </div>
+              </div>
+              {selectedPrediction ? (
+                <div className="rounded-md bg-black/30 px-3 py-2 text-right">
+                  <div className="text-xs text-white/50">Your pick</div>
+                  <div className="text-sm font-semibold text-white">{formatPrediction(selectedPrediction.predictionType)}</div>
+                </div>
+              ) : null}
+            </div>
+          </section>
+
+          <section className="mb-5">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="font-semibold text-white">Prediction</h2>
+              <span className="text-xs text-white/50">Closes in final 10 seconds</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {predictionOptions.map((option) => {
+                const active = selectedPrediction?.predictionType === option.value;
+                return (
+                  <motion.button
+                    key={option.value}
+                    disabled={predictionsClosed}
+                    onClick={() => props.onSubmit(option.value)}
+                    className={`relative h-[82px] overflow-hidden rounded-lg border p-3 text-left transition disabled:opacity-40 ${active ? "border-white bg-lime-300 text-black shadow-lg shadow-lime-300/20" : "border-white/10 bg-white/8 text-white"}`}
+                    whileTap={{ scale: 0.96 }}
+                    animate={active ? { y: [0, -2, 0] } : { y: 0 }}
+                    transition={active ? { repeat: Infinity, duration: 1.4 } : undefined}
+                  >
+                    <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${option.tone}`} />
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className="text-2xl leading-none">{option.icon}</span>
+                      <span className={active ? "text-xs font-black text-black/60" : "text-xs font-black text-lime-200"}>+{option.points}</span>
+                    </div>
+                    <div className="text-sm font-black">{option.label}</div>
+                    <div className={active ? "text-xs text-black/70" : "text-xs text-white/50"}>{option.points} base points</div>
+                  </motion.button>
+                );
+              })}
+            </div>
+          </section>
+        </>
+      )}
+
+      <section className="mb-5 rounded-lg border border-white/10 bg-black/25 p-3">
+        <div className="mb-3 flex items-center justify-between gap-3">
           <div>
-            <div className="text-4xl font-semibold text-white">{timeToLock !== null ? formatDuration(timeToLock) : "--:--"}</div>
-            <div className="mt-1 text-sm text-white/60">
-              {predictionRound ? (predictionsClosed ? "Predictions closed for this round" : "Predictions activate after 10 seconds") : "No prediction round is open"}
+            <h2 className="text-sm font-semibold text-white">Match Center</h2>
+            <div className="text-xs text-white/45">
+              {leader ? `#1 ${leader.username} · ${formatScore(leader.score)} pts` : "Live feed and rankings"}
             </div>
           </div>
-          {selectedPrediction ? (
-            <div className="rounded-md bg-black/30 px-3 py-2 text-right">
-              <div className="text-xs text-white/50">Your pick</div>
-              <div className="text-sm font-semibold text-white">{formatPrediction(selectedPrediction.predictionType)}</div>
+          {props.user ? (
+            <div className="rounded bg-white/8 px-2 py-1 text-xs font-semibold text-white/70">
+              {props.user.username}
             </div>
           ) : null}
         </div>
+
+        {!fullTime ? <div className="mb-3 grid grid-cols-3 gap-1 rounded-md bg-white/8 p-1">
+          {([
+            ["feed", "Feed"],
+            ["leaderboard", "Leaders"],
+            ["rounds", "Rounds"],
+          ] as Array<[MatchPanelTab, string]>).map(([value, label]) => (
+            <button
+              key={value}
+              onClick={() => setActiveTab(value)}
+              className={`h-10 rounded px-2 text-xs font-black transition ${activeTab === value ? "bg-lime-300 text-black" : "text-white/60 hover:bg-white/8 hover:text-white"}`}
+            >
+              {label}
+              <span className={activeTab === value ? "ml-1 text-black/55" : "ml-1 text-white/35"}>{tabCounts[value]}</span>
+            </button>
+          ))}
+        </div> : null}
+
+        <AnimatePresence mode="wait" initial={false}>
+          {activeTab === "feed" ? (
+            <motion.div key="feed" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
+              <Timeline events={visibleEvents} compact />
+            </motion.div>
+          ) : null}
+          {(fullTime || activeTab === "leaderboard") ? (
+            <motion.div key="leaderboard" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
+              <MatchLeaderboard rows={props.leaderboard} user={props.user} compact />
+            </motion.div>
+          ) : null}
+          {activeTab === "rounds" ? (
+            <motion.div key="rounds" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
+              <RecentPredictions predictions={recentPredictions} compact />
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
       </section>
 
-      <section className="mb-5">
-        <div className="mb-3 flex items-center justify-between">
-          <h2 className="font-semibold text-white">Prediction</h2>
-          <span className="text-xs text-white/50">Closes in final 10 seconds</span>
-        </div>
-        <div className="grid grid-cols-2 gap-2">
-          {predictionOptions.map((option) => {
-            const active = selectedPrediction?.predictionType === option.value;
-            return (
-              <motion.button
-                key={option.value}
-                disabled={predictionsClosed}
-                onClick={() => props.onSubmit(option.value)}
-                className={`relative h-[82px] overflow-hidden rounded-lg border p-3 text-left transition disabled:opacity-40 ${active ? "border-white bg-lime-300 text-black shadow-lg shadow-lime-300/20" : "border-white/10 bg-white/8 text-white"}`}
-                whileTap={{ scale: 0.96 }}
-                animate={active ? { y: [0, -2, 0] } : { y: 0 }}
-                transition={active ? { repeat: Infinity, duration: 1.4 } : undefined}
-              >
-                <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${option.tone}`} />
-                <div className="mb-2 flex items-center justify-between">
-                  <span className="text-2xl leading-none">{option.icon}</span>
-                  <span className={active ? "text-xs font-black text-black/60" : "text-xs font-black text-lime-200"}>+{option.points}</span>
-                </div>
-                <div className="text-sm font-black">{option.label}</div>
-                <div className={active ? "text-xs text-black/70" : "text-xs text-white/50"}>{option.points} base points</div>
-              </motion.button>
-            );
-          })}
-        </div>
-      </section>
-
-      <RecentPredictions predictions={props.detail?.myPredictions ?? []} />
-      <Timeline events={visibleEvents} />
-      <MatchLeaderboard rows={props.leaderboard} user={props.user} />
       {props.showAdminTest ? (
         <AdminTestControls
           matchId={match.id}
@@ -634,13 +1077,48 @@ function MatchExperience(props: {
   );
 }
 
-function RecentPredictions({ predictions }: { predictions: Prediction[] }) {
-  const recent = predictions.slice(0, 4);
-  if (recent.length === 0) return null;
+function RoomHeader({ room }: { room: Room }) {
+  const [copied, setCopied] = useState(false);
+
+  async function copyCode() {
+    const text = `Join my Next3 room ${room.code} for ${room.match.homeTeam} vs ${room.match.awayTeam}`;
+    await navigator.clipboard?.writeText(text).catch(() => undefined);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1800);
+  }
 
   return (
-    <section className="mb-5">
-      <h2 className="mb-3 font-semibold text-white">Your Rounds</h2>
+    <section className="mb-4 rounded-lg border border-sky-300/25 bg-sky-300/10 p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="mb-1 flex items-center gap-2 text-xs font-black uppercase tracking-[0.18em] text-sky-100">
+            <Users size={15} />
+            Private Room
+          </div>
+          <div className="truncate text-lg font-black text-white">{room.name}</div>
+          <div className="text-xs text-white/50">{room.memberCount} players joined</div>
+        </div>
+        <button onClick={copyCode} className="grid h-11 w-11 shrink-0 place-items-center rounded-md bg-sky-300 text-black" aria-label="Copy room code">
+          <Copy size={18} />
+        </button>
+      </div>
+      <div className="flex items-center justify-between rounded-md bg-black/25 px-3 py-2">
+        <span className="text-xs font-semibold text-white/50">Share code</span>
+        <span className="text-lg font-black tracking-[0.18em] text-sky-100">{copied ? "COPIED" : room.code}</span>
+      </div>
+    </section>
+  );
+}
+
+function RecentPredictions({ predictions, compact = false }: { predictions: Prediction[]; compact?: boolean }) {
+  const recent = predictions.slice(0, 4);
+  if (recent.length === 0) {
+    return compact ? <div className="py-8 text-center text-sm text-white/45">No predictions yet</div> : null;
+  }
+
+  return (
+    <section className={compact ? "" : "mb-5"}>
+      {!compact ? <h2 className="mb-3 font-semibold text-white">Your Rounds</h2> : null}
       <div className="space-y-2">
         {recent.map((prediction) => (
           <div key={prediction.id} className="flex items-center justify-between rounded-lg border border-white/10 bg-black/25 px-3 py-2">
@@ -658,11 +1136,11 @@ function RecentPredictions({ predictions }: { predictions: Prediction[] }) {
   );
 }
 
-function Timeline({ events }: { events: EventRecord[] }) {
+function Timeline({ events, compact = false }: { events: EventRecord[]; compact?: boolean }) {
   return (
-    <section className="mb-5">
-      <h2 className="mb-3 font-semibold text-white">Live Feed</h2>
-      <div className="min-h-[108px] space-y-2 rounded-lg border border-white/10 bg-black/25 p-3">
+    <section className={compact ? "" : "mb-5"}>
+      {!compact ? <h2 className="mb-3 font-semibold text-white">Live Feed</h2> : null}
+      <div className={`${compact ? "max-h-[360px] overflow-y-auto pr-1" : "min-h-[108px] rounded-lg border border-white/10 bg-black/25 p-3"} space-y-2`}>
         {events.length === 0 ? <div className="py-8 text-center text-sm text-white/45">Waiting for TxLINE events</div> : null}
         {events.map((event) => (
           <motion.div layout key={event.id} className={`flex items-center gap-3 rounded-md px-3 py-2 ${event.simulated ? "border border-sky-300/30 bg-sky-300/10" : "bg-white/[0.06]"}`}>
@@ -734,10 +1212,10 @@ function eventNotificationKey(event: EventRecord): string {
   ].join(":");
 }
 
-function MatchLeaderboard({ rows, user }: { rows: LeaderboardRow[]; user: User | null }) {
+function MatchLeaderboard({ rows, user, compact = false }: { rows: LeaderboardRow[]; user: User | null; compact?: boolean }) {
   return (
-    <section className="mb-5">
-      <h2 className="mb-3 font-semibold text-white">Match Leaderboard</h2>
+    <section className={compact ? "" : "mb-5"}>
+      {!compact ? <h2 className="mb-3 font-semibold text-white">Match Leaderboard</h2> : null}
       <LeaderboardList rows={rows} user={user} empty="No points yet" />
     </section>
   );
@@ -806,14 +1284,31 @@ function AdminTestControls(props: {
   );
 }
 
-function GlobalLeaderboard({ rows }: { rows: LeaderboardRow[] }) {
+function GlobalLeaderboard({
+  rows,
+  currentUserRank,
+  user,
+}: {
+  rows: LeaderboardRow[];
+  currentUserRank: LeaderboardRow | null;
+  user: User | null;
+}) {
+  const currentUserVisible = rows.some((row) => row.username === user?.username);
+  const pinnedUserRank = user && currentUserRank && !currentUserVisible ? currentUserRank : null;
+
   return (
-    <section className="mt-6 pb-6">
+    <section className="pb-6">
       <div className="mb-3 flex items-center gap-2">
         <Trophy className="text-lime-200" size={18} />
         <h2 className="font-semibold text-white">Global Leaders</h2>
       </div>
-      <LeaderboardList rows={rows.slice(0, 5)} user={null} empty="Scores appear after live rounds resolve" />
+      <LeaderboardList rows={rows} user={user} empty="Scores appear after live rounds resolve" />
+      {pinnedUserRank ? (
+        <div className="mt-3">
+          <div className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-white/35">Your position</div>
+          <LeaderboardList rows={[pinnedUserRank]} user={user} empty="" />
+        </div>
+      ) : null}
     </section>
   );
 }

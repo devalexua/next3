@@ -17,7 +17,8 @@ type TxLineFixture = {
 };
 
 export const ROUND_LENGTH_MINUTES = 3;
-const ROUND_COUNT = 40;
+export const MATCH_DURATION_MINUTES = 90;
+const ROUND_COUNT = 30;
 
 export async function syncFixtures(): Promise<{ imported: number }> {
   requireTxLineCredentials();
@@ -78,7 +79,7 @@ export function deriveMatchStatus(startTime: Date): MatchStatus {
   const now = Date.now();
   const start = startTime.getTime();
   const openAt = start;
-  const finishAt = start + 120 * 60_000;
+  const finishAt = start + MATCH_DURATION_MINUTES * 60_000;
 
   if (now >= finishAt) return MatchStatus.FINISHED;
   if (now >= start) return MatchStatus.LIVE;

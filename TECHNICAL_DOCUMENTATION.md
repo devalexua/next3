@@ -12,8 +12,8 @@ Core user flow:
 
 1. User registers or logs in with username and password.
 2. User sees synced World Cup fixtures.
-3. During a live match, the user opens the match screen.
-4. User submits one prediction for the current 3-minute round.
+3. User either opens a public match or creates/joins a private friend room for a specific match.
+4. During a live match, the user submits one prediction for the current 3-minute round.
 5. TxLINE live events arrive on the backend.
 6. Backend stores events, resolves predictions, updates scores/streaks, and broadcasts Socket.IO updates.
 7. Frontend animates live events, score changes, prediction wins, streaks, and leaderboard updates.
@@ -146,14 +146,17 @@ Round 3: 6' -> 9'
 ...
 ```
 
-The backend currently creates 40 rounds per match, covering 120 minutes. Round constants live in `src/server/txline.ts`:
+The backend currently creates 30 rounds per match, covering the first 90 minutes. Round constants live in `src/server/txline.ts`:
 
 ```ts
 ROUND_LENGTH_MINUTES = 3
-ROUND_COUNT = 40
+ROUND_COUNT = 30
+MATCH_DURATION_MINUTES = 90
 ```
 
 Users predict the current active 3-minute round, not a future round.
+
+After 90 minutes, predictions close and the frontend shows the final leaderboard instead of opening more rounds.
 
 ### Prediction Options
 
@@ -171,6 +174,14 @@ Database uniqueness is enforced by:
 ```text
 Prediction @@unique([userId, matchId, roundId])
 ```
+
+Private friend rooms use separate room-scoped predictions with the same gameplay rules:
+
+```text
+RoomPrediction @@unique([userId, roomId, roundId])
+```
+
+Room predictions do not update the public match leaderboard or global leaderboard. They only update the leaderboard for that room.
 
 If the existing prediction is still pending, the user may change it during the open part of the round. Changing a prediction resets its activation delay.
 
@@ -265,18 +276,26 @@ Prisma models:
 
 - `User`: username/password account.
 - `Match`: TxLINE fixture metadata, teams, score, status.
+- `Room`: private friend room bound to one match and a shareable room code.
+- `RoomMember`: users who joined a private room.
 - `Round`: fixed 3-minute match windows.
 - `Prediction`: user prediction for a match round.
+- `RoomPrediction`: user prediction inside a private room.
 - `Event`: stored TxLINE event with raw payload.
 - `UserMatchState`: per-match user score and streak.
+- `RoomUserMatchState`: room-scoped user score and streak.
 
 Key constraints:
 
 - `Match.txlineFixtureId` is unique.
 - `Round` is unique by `(matchId, number)`.
 - `Prediction` is unique by `(userId, matchId, roundId)`.
+- `Room.code` is unique.
+- `RoomMember` is unique by `(roomId, userId)`.
+- `RoomPrediction` is unique by `(userId, roomId, roundId)`.
 - `Event` is unique by `(matchId, txlineSeq)` to avoid duplicate processing of the same TxLINE sequence.
 - `UserMatchState` is unique by `(userId, matchId)`.
+- `RoomUserMatchState` is unique by `(userId, roomId)`.
 
 Migrations:
 
@@ -285,6 +304,7 @@ Migrations:
 20260624180015_scoring_float
 20260625120000_match_scores
 20260625123000_prediction_effective_at
+20260626120000_friend_rooms
 ```
 
 ## REST API
@@ -320,6 +340,34 @@ Predictions:
 POST /api/matches/:id/predictions
 ```
 
+Friend rooms:
+
+```text
+GET  /api/rooms
+POST /api/rooms
+POST /api/rooms/join
+GET  /api/rooms/:code
+GET  /api/rooms/:code/leaderboard
+POST /api/rooms/:code/predictions
+```
+
+Room creation body:
+
+```json
+{
+  "matchId": "match_id",
+  "name": "Optional room name"
+}
+```
+
+Room join body:
+
+```json
+{
+  "code": "ABC123"
+}
+```
+
 Body:
 
 ```json
@@ -334,6 +382,9 @@ Admin-only test game:
 GET  /api/admin/test-game/status
 POST /api/admin/test-game/start
 POST /api/admin/test-game/stop
+GET  /api/admin/demo/status
+POST /api/admin/demo/start
+POST /api/admin/demo/stop
 ```
 
 Admin routes require:
@@ -350,9 +401,9 @@ Current emitted events:
 
 - `event_created`: a live TxLINE or simulated event was created.
 - `match_score_updated`: match score changed.
-- `prediction_won`: current user may receive a win notification if it belongs to them.
-- `streak_updated`: user streak/score changed.
-- `leaderboard_updated`: leaderboard should be refreshed.
+- `prediction_won`: current user may receive a win notification if it belongs to them. Room wins include `roomId`.
+- `streak_updated`: user streak/score changed. Room streak updates include `roomId`.
+- `leaderboard_updated`: leaderboard should be refreshed. Room updates include `roomId`.
 - `round_finished`: expired rounds were resolved.
 - `test_game_status`: admin test game was enabled/disabled.
 
@@ -365,6 +416,9 @@ Notifications are scoped to the currently opened match screen. The main match li
 The frontend is mobile-first and game-oriented:
 
 - Match list with status, kickoff countdown, and score.
+- Friend room join panel and room cards for joined rooms.
+- Create-room action from each match card.
+- Private room match screen with shareable room code.
 - Match page with animated score display.
 - Current 3-minute round countdown.
 - Prediction grid with base points.
@@ -496,6 +550,57 @@ Frontend visibility:
 Admin API calls require `x-admin-token`.
 
 The simulator broadcasts synthetic live events only to help validate UI animations and realtime behavior during demos.
+
+## Demo Competition Mode
+
+Demo competition mode is designed for recording a gameplay video. Unlike the visual-only test game, this mode writes to the database and drives the real game engine:
+
+- Creates a live `Tunisia vs Netherlands` replay match.
+- Creates demo users.
+- Creates predictions for each demo user.
+- Emits a compressed replay based on TxLINE historical data for fixture `17588236`.
+- Awards real points through the normal prediction resolver.
+- Updates match score, event timeline, streaks, and match/global leaderboards.
+
+The replay match is intentionally hidden from the normal match list by default. It appears in `/api/matches` only while the demo competition is actively running. Stopping the demo or reaching the end of the replay marks the replay match as `FINISHED`, which removes it from the public match list.
+
+Demo users:
+
+| Username | Password |
+|---|---|
+| `alex` | `demo123` |
+| `mike` | `demo123` |
+| `john` | `demo123` |
+| `sara` | `demo123` |
+
+Start the demo:
+
+```bash
+curl -X POST "$API_URL/api/admin/demo/start" \
+  -H "x-admin-token: $ADMIN_TEST_TOKEN"
+```
+
+Stop the demo:
+
+```bash
+curl -X POST "$API_URL/api/admin/demo/stop" \
+  -H "x-admin-token: $ADMIN_TEST_TOKEN"
+```
+
+Check status:
+
+```bash
+curl "$API_URL/api/admin/demo/status" \
+  -H "x-admin-token: $ADMIN_TEST_TOKEN"
+```
+
+Recommended recording flow:
+
+1. Log in as `alex` with password `demo123`.
+2. Start demo competition from the terminal.
+3. Open the `Tunisia vs Netherlands` replay match.
+4. Record live events, score changes, prediction wins, streak changes, and leaderboard movement.
+5. Stop the demo when recording is complete.
 
 ## Container Image
 

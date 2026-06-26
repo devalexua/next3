@@ -45,12 +45,16 @@ enum EventType {
 }
 
 model User {
-  id           String           @id @default(cuid())
-  username     String           @unique
-  passwordHash String
-  createdAt    DateTime         @default(now())
-  predictions  Prediction[]
-  matchStates  UserMatchState[]
+  id              String               @id @default(cuid())
+  username        String               @unique
+  passwordHash    String
+  createdAt       DateTime             @default(now())
+  predictions     Prediction[]
+  matchStates     UserMatchState[]
+  createdRooms    Room[]
+  roomMemberships RoomMember[]
+  roomPredictions RoomPrediction[]
+  roomStates      RoomUserMatchState[]
 }
 
 model Match {
@@ -74,9 +78,41 @@ model Match {
   predictions        Prediction[]
   events             Event[]
   userStates         UserMatchState[]
+  rooms              Room[]
+  roomPredictions    RoomPrediction[]
+  roomUserStates     RoomUserMatchState[]
 
   @@index([startTime])
   @@index([status])
+}
+
+model Room {
+  id              String               @id @default(cuid())
+  code            String               @unique
+  name            String
+  matchId         String
+  createdByUserId String
+  createdAt       DateTime             @default(now())
+  match           Match                @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  createdBy       User                 @relation(fields: [createdByUserId], references: [id], onDelete: Cascade)
+  members         RoomMember[]
+  predictions     RoomPrediction[]
+  userStates      RoomUserMatchState[]
+
+  @@index([matchId])
+  @@index([createdByUserId])
+}
+
+model RoomMember {
+  id       String   @id @default(cuid())
+  roomId   String
+  userId   String
+  joinedAt DateTime @default(now())
+  room     Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([roomId, userId])
+  @@index([userId])
 }
 
 model Round {
@@ -88,6 +124,7 @@ model Round {
   status      RoundStatus  @default(UPCOMING)
   match       Match        @relation(fields: [matchId], references: [id], onDelete: Cascade)
   predictions Prediction[]
+  roomPredictions RoomPrediction[]
 
   @@unique([matchId, number])
 }
@@ -108,6 +145,27 @@ model Prediction {
 
   @@unique([userId, matchId, roundId])
   @@index([matchId, roundId])
+}
+
+model RoomPrediction {
+  id             String           @id @default(cuid())
+  userId         String
+  roomId         String
+  matchId        String
+  roundId        String
+  predictionType PredictionType
+  status         PredictionStatus @default(PENDING)
+  pointsAwarded  Float            @default(0)
+  effectiveAt    DateTime         @default(now())
+  createdAt      DateTime         @default(now())
+  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  room           Room             @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  match          Match            @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  round          Round            @relation(fields: [roundId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roomId, roundId])
+  @@index([matchId, roundId])
+  @@index([roomId, matchId])
 }
 
 model Event {
@@ -140,4 +198,22 @@ model UserMatchState {
 
   @@unique([userId, matchId])
   @@index([matchId, score])
+}
+
+model RoomUserMatchState {
+  id        String   @id @default(cuid())
+  userId    String
+  roomId    String
+  matchId   String
+  score     Float    @default(0)
+  streak    Int      @default(0)
+  rank      Int?
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  match     Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roomId])
+  @@index([roomId, score])
+  @@index([matchId])
 }
