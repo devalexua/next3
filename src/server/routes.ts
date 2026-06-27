@@ -1,4 +1,4 @@
-import { MatchStatus, PredictionStatus, PredictionType, type Event } from "@prisma/client";
+import { MatchStatus, PredictionStatus, PredictionType, type Event, type Prisma } from "@prisma/client";
 import type { FastifyInstance } from "fastify";
 import { clearSession, getCurrentUser, hashPassword, requireUser, setSession, verifyPassword } from "./auth.js";
 import { serverEnv } from "./env.js";
@@ -138,19 +138,39 @@ export function registerRoutes(app: FastifyInstance, testGame: TestGameControlle
     return testGame.stopDemoCompetition();
   });
 
-  app.get("/api/matches", async () => {
+  app.get("/api/matches", async (request, reply) => {
     await refreshMatchStatuses();
+    const { view = "active" } = request.query as { view?: "active" | "past" | "mine" };
+    if (!(["active", "past", "mine"] as const).includes(view)) {
+      return reply.code(400).send({ error: "Unknown match view." });
+    }
+
+    const user = view === "mine" ? await getCurrentUser(request) : null;
+    if (view === "mine" && !user) {
+      return reply.code(401).send({ error: "Log in to view your games." });
+    }
+
     const activeDemoMatchId = testGame.demoCompetitionStatus().matchId;
+    const viewFilter: Prisma.MatchWhereInput = view === "active"
+      ? { status: { not: MatchStatus.FINISHED } }
+      : view === "past"
+        ? { status: MatchStatus.FINISHED }
+        : {
+            OR: [
+              { predictions: { some: { userId: user!.id } } },
+              { roomPredictions: { some: { userId: user!.id } } },
+              { rooms: { some: { members: { some: { userId: user!.id } } } } },
+            ],
+          };
     const matches = await prisma.match.findMany({
       where: {
-        status: { not: MatchStatus.FINISHED },
-        OR: [
-          { txlineFixtureId: { not: BigInt(demoFixtureId) } },
-          ...(activeDemoMatchId ? [{ id: activeDemoMatchId }] : []),
+        AND: [
+          viewFilter,
+          activeDemoMatchId ? {} : { txlineFixtureId: { not: BigInt(demoFixtureId) } },
         ],
       },
-      orderBy: { startTime: "asc" },
-      take: 40,
+      orderBy: { startTime: view === "active" ? "asc" : "desc" },
+      take: view === "past" ? 20 : 40,
     });
 
     return { matches: await Promise.all(matches.map(serializeMatch)) };
@@ -582,6 +602,7 @@ async function serializeMatch(match: {
   awayScore: number;
   clockSeconds: number;
   clockRunning: boolean;
+  clockUpdatedAt: Date | null;
   participant1IsHome: boolean;
   startTime: Date;
   status: MatchStatus;
@@ -591,6 +612,7 @@ async function serializeMatch(match: {
     txlineFixtureId: match.txlineFixtureId.toString(),
     startTime: match.startTime.toISOString(),
     opensAt: match.startTime.toISOString(),
+    clockUpdatedAt: match.clockUpdatedAt?.toISOString() ?? null,
   };
 }
 
@@ -612,6 +634,7 @@ async function serializeRoom(room: {
     awayScore: number;
     clockSeconds: number;
     clockRunning: boolean;
+    clockUpdatedAt: Date | null;
     participant1IsHome: boolean;
     startTime: Date;
     status: MatchStatus;
@@ -726,7 +749,7 @@ function isNonDisplayEvent(event: Event): boolean {
 }
 
 function getPredictionRound(
-  match: { startTime: Date; status: MatchStatus; clockSeconds: number; clockRunning: boolean },
+  match: { startTime: Date; status: MatchStatus; clockSeconds: number; clockRunning: boolean; clockUpdatedAt: Date | null },
   rounds: Array<{ id: string; number: number; startMinute: number; endMinute: number }>,
 ) {
   if (match.status !== MatchStatus.LIVE && match.status !== MatchStatus.OPEN && !match.clockRunning) return null;
@@ -738,7 +761,7 @@ function getPredictionRound(
 }
 
 function getCurrentRound(
-  match: { startTime: Date; status: MatchStatus; clockSeconds: number; clockRunning: boolean },
+  match: { startTime: Date; status: MatchStatus; clockSeconds: number; clockRunning: boolean; clockUpdatedAt: Date | null },
   rounds: Array<{ id: string; number: number; startMinute: number; endMinute: number }>,
 ) {
   if (match.status === MatchStatus.HALF_TIME && !match.clockRunning) return null;
@@ -749,9 +772,10 @@ function getCurrentRound(
   return rounds.find((round) => round.number === currentRoundNumber) ?? null;
 }
 
-function getMatchElapsedMinute(match: { startTime: Date; clockSeconds: number }): number | null {
-  if (match.clockSeconds > 0) return Math.floor(match.clockSeconds / 60);
-  if ("status" in match && match.status === MatchStatus.LIVE) return null;
+function getMatchElapsedMinute(match: { startTime: Date; status: MatchStatus; clockSeconds: number; clockRunning: boolean; clockUpdatedAt: Date | null }): number | null {
+  const clockSeconds = getEffectiveClockSeconds(match);
+  if (clockSeconds > 0 || match.clockRunning) return Math.floor(clockSeconds / 60);
+  if (match.status === MatchStatus.LIVE) return null;
 
   const kickoff = match.startTime.getTime();
   const now = Date.now();
@@ -760,14 +784,21 @@ function getMatchElapsedMinute(match: { startTime: Date; clockSeconds: number })
 }
 
 function getSecondsUntilRoundEnd(
-  match: { startTime: Date; clockSeconds: number },
+  match: { startTime: Date; status: MatchStatus; clockSeconds: number; clockRunning: boolean; clockUpdatedAt: Date | null },
   round: { endMinute: number },
 ): number | null {
-  if (match.clockSeconds > 0) {
-    return round.endMinute * 60 - match.clockSeconds;
+  const clockSeconds = getEffectiveClockSeconds(match);
+  if (clockSeconds > 0 || match.clockRunning) {
+    return round.endMinute * 60 - clockSeconds;
   }
-  if ("status" in match && match.status === MatchStatus.LIVE) return null;
+  if (match.status === MatchStatus.LIVE) return null;
 
   const roundEndsAt = match.startTime.getTime() + round.endMinute * 60_000;
   return Math.floor((roundEndsAt - Date.now()) / 1000);
+}
+
+function getEffectiveClockSeconds(match: { clockSeconds: number; clockRunning: boolean; clockUpdatedAt: Date | null }): number {
+  if (!match.clockRunning || !match.clockUpdatedAt) return match.clockSeconds;
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - match.clockUpdatedAt.getTime()) / 1000));
+  return match.clockSeconds + elapsedSeconds;
 }

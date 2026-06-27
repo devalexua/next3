@@ -158,7 +158,12 @@ export async function closeExpiredRounds(): Promise<number> {
 }
 
 function getElapsedMinutes(match: Match): number {
+  if (match.clockRunning && match.clockUpdatedAt) {
+    const elapsedSeconds = Math.max(0, Math.floor((Date.now() - match.clockUpdatedAt.getTime()) / 1000));
+    return Math.floor((match.clockSeconds + elapsedSeconds) / 60);
+  }
   if (match.clockSeconds > 0) return Math.floor(match.clockSeconds / 60);
+  if (match.status === MatchStatus.LIVE) return -1;
   return Math.floor((Date.now() - match.startTime.getTime()) / 60_000);
 }
 

@@ -1,0 +1,1 @@
+ALTER TABLE "Match" ADD COLUMN "clockUpdatedAt" TIMESTAMP(3);

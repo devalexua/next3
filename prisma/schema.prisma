@@ -71,6 +71,7 @@ model Match {
   awayScore          Int              @default(0)
   clockSeconds       Int              @default(0)
   clockRunning       Boolean          @default(false)
+  clockUpdatedAt     DateTime?
   participant1       String
   participant2       String
   participant1IsHome Boolean

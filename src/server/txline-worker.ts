@@ -9,6 +9,7 @@ import { prisma } from "./prisma.js";
 import { requireTxLineCredentials, serverEnv } from "./env.js";
 import { presentEvent } from "./event-presenter.js";
 import { ingestNormalizedEvent, closeExpiredRounds } from "./game-engine.js";
+import { soccerClockFromRecord, soccerGoalsFromRecord, soccerStatusFromRecord } from "./txline-state.js";
 
 type WorkerHandle = {
   stop: () => void;
@@ -147,10 +148,11 @@ async function getTrackedMatch(fixtureId: number): Promise<{
   awayScore: number;
   clockSeconds: number;
   clockRunning: boolean;
+  clockUpdatedAt: Date | null;
 } | null> {
   const match = await prisma.match.findUnique({
     where: { txlineFixtureId: BigInt(fixtureId) },
-    select: { id: true, status: true, participant1IsHome: true, homeScore: true, awayScore: true, clockSeconds: true, clockRunning: true },
+    select: { id: true, status: true, participant1IsHome: true, homeScore: true, awayScore: true, clockSeconds: true, clockRunning: true, clockUpdatedAt: true },
   });
 
   if (!match || match.status === MatchStatus.FINISHED) return null;
@@ -159,16 +161,17 @@ async function getTrackedMatch(fixtureId: number): Promise<{
 
 async function updateMatchClockFromRecord(
   raw: TxLineScoresRecord,
-  match: { id: string; status: MatchStatus; clockSeconds: number; clockRunning: boolean },
-): Promise<{ matchId: string; status: MatchStatus; clockSeconds: number; clockRunning: boolean } | null> {
+  match: { id: string; status: MatchStatus; clockSeconds: number; clockRunning: boolean; clockUpdatedAt: Date | null },
+): Promise<{ matchId: string; status: MatchStatus; clockSeconds: number; clockRunning: boolean; clockUpdatedAt: string | null } | null> {
   const status = soccerStatusFromRecord(raw);
   const clock = soccerClockFromRecord(raw);
-  const data: { status?: MatchStatus; clockSeconds?: number; clockRunning?: boolean } = {};
+  const data: { status?: MatchStatus; clockSeconds?: number; clockRunning?: boolean; clockUpdatedAt?: Date } = {};
 
   if (status) data.status = status;
   if (clock) {
     data.clockSeconds = clock.seconds;
     data.clockRunning = clock.running;
+    data.clockUpdatedAt = new Date();
     if (clock.running) data.status = MatchStatus.LIVE;
   }
 
@@ -178,7 +181,7 @@ async function updateMatchClockFromRecord(
   const nextClockSeconds = data.clockSeconds ?? match.clockSeconds;
   const nextClockRunning = data.clockRunning ?? match.clockRunning;
 
-  if (
+  if (!clock &&
     nextStatus === match.status &&
     nextClockSeconds === match.clockSeconds &&
     nextClockRunning === match.clockRunning
@@ -192,41 +195,19 @@ async function updateMatchClockFromRecord(
     status: nextStatus,
     clockSeconds: nextClockSeconds,
     clockRunning: nextClockRunning,
+    clockUpdatedAt: data.clockUpdatedAt?.toISOString() ?? match.clockUpdatedAt?.toISOString() ?? null,
   };
-}
-
-function soccerStatusFromRecord(raw: TxLineScoresRecord): MatchStatus | null {
-  const statusId = getNumber(raw.statusSoccerId) ?? getNumber(raw.StatusId);
-  const action = String(raw.action ?? raw.Action ?? "").toLowerCase();
-
-  if (statusId === 3 || action === "halftime_finalised") return MatchStatus.HALF_TIME;
-  if (statusId === 2 || statusId === 4) return MatchStatus.LIVE;
-  if (statusId !== null && statusId >= 5) return MatchStatus.FINISHED;
-  return null;
-}
-
-function soccerClockFromRecord(raw: TxLineScoresRecord): { seconds: number; running: boolean } | null {
-  const clock = asObject(raw.Clock) ?? asObject((raw as { clock?: unknown }).clock);
-  const seconds = getNumber(clock?.Seconds) ?? getNumber(clock?.seconds);
-  const running = getBoolean(clock?.Running) ?? getBoolean(clock?.running);
-
-  if (seconds === null || running === null) return null;
-  return { seconds, running };
 }
 
 async function updateMatchScoreFromRecord(
   raw: TxLineScoresRecord,
   match: { id: string; participant1IsHome: boolean; homeScore: number; awayScore: number },
 ): Promise<{ matchId: string; homeScore: number; awayScore: number } | null> {
-  const currentParticipant1Score = match.participant1IsHome ? match.homeScore : match.awayScore;
-  const currentParticipant2Score = match.participant1IsHome ? match.awayScore : match.homeScore;
-  const participant1Score = extractParticipantGoals(raw, "Participant1") ?? currentParticipant1Score;
-  const participant2Score = extractParticipantGoals(raw, "Participant2") ?? currentParticipant2Score;
+  const goals = soccerGoalsFromRecord(raw);
+  if (!goals) return null;
 
-  if (participant1Score === currentParticipant1Score && participant2Score === currentParticipant2Score) return null;
-
-  const homeScore = match.participant1IsHome ? participant1Score : participant2Score;
-  const awayScore = match.participant1IsHome ? participant2Score : participant1Score;
+  const homeScore = match.participant1IsHome ? goals.participant1 : goals.participant2;
+  const awayScore = match.participant1IsHome ? goals.participant2 : goals.participant1;
 
   if (homeScore === match.homeScore && awayScore === match.awayScore) return null;
 
@@ -236,30 +217,6 @@ async function updateMatchScoreFromRecord(
   });
 
   return { matchId: match.id, homeScore, awayScore };
-}
-
-function extractParticipantGoals(raw: TxLineScoresRecord, participantKey: "Participant1" | "Participant2"): number | null {
-  const score = asObject(raw.scoreSoccer) ?? asObject((raw as { ScoreSoccer?: unknown }).ScoreSoccer) ?? asObject(raw.Score);
-  const participant = asObject(score?.[participantKey]) ?? asObject(score?.[participantKey.toLowerCase()]);
-  const total = asObject(participant?.Total) ?? asObject(participant?.total);
-
-  return getNumber(total?.Goals) ?? getNumber(total?.goals) ?? null;
-}
-
-function asObject(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
-function getNumber(value: unknown): number | null {
-  if (typeof value === "number") return value;
-  if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number(value);
-  return null;
-}
-
-function getBoolean(value: unknown): boolean | null {
-  return typeof value === "boolean" ? value : null;
 }
 
 async function serializeEvent(event: Event) {

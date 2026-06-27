@@ -102,6 +102,13 @@ Live stream endpoint:
 GET https://txline.txodds.com/api/scores/stream
 ```
 
+Fixture and recovery snapshot endpoints:
+
+```text
+GET https://txline.txodds.com/api/fixtures/snapshot?competitionId=72
+GET https://txline.txodds.com/api/scores/snapshot/<fixtureId>
+```
+
 Required headers:
 
 ```text
@@ -117,10 +124,14 @@ The worker:
 - Parses each TxLINE score record.
 - Normalizes event type, fixture id, TxLINE sequence, match minute, participant, and raw action.
 - Checks whether the fixture belongs to a tracked match.
-- Updates match score from `scoreSoccer.Participant1.Total.Goals` and `scoreSoccer.Participant2.Total.Goals`.
+- Updates match score from TxLINE soccer `Stats` keys `1` and `2`, documented as Participant 1 and Participant 2 full-game total goals.
 - Stores recognized live events.
 - Resolves eligible predictions.
 - Broadcasts updates to connected frontend clients.
+
+Fixture metadata is synchronized at backend startup and every 5 minutes. The live stream remains the primary source for match state, score, clock, and events. Because a stream connection can miss a transition while the backend is disconnected, active matches are reconciled against their TxLINE score snapshots every minute. A snapshot record with `StatusId: 5` or `Action: game_finalised` marks the match as finished. The 20 most recent completed matches have their final scores reconciled at startup and every 10 minutes, covering fixtures imported after they ended. As a final recovery guard, a match still marked `LIVE` or `HALF_TIME` five hours after scheduled kickoff is closed locally.
+
+`GET /api/matches` reads PostgreSQL; it does not call TxLINE directly. Finished matches are excluded from that response.
 
 Recognized event types:
 
@@ -156,7 +167,7 @@ MATCH_DURATION_MINUTES = 90
 
 Users predict the current active 3-minute round, not a future round.
 
-Rounds are driven by the TxLINE soccer clock, not by wall-clock time since kickoff. When TxLINE sends half-time status, predictions pause and no new round opens during the break. When TxLINE sends second-half live status, predictions resume from the live match clock.
+Rounds are driven by the TxLINE soccer clock, not by wall-clock time since kickoff. Each clock update persists `clockSeconds`, `clockRunning`, and `clockUpdatedAt`. While the clock is running, both backend validation and the frontend countdown interpolate whole seconds from that anchor, so the timer advances every second between TxLINE feed records and is corrected by the next authoritative update. When TxLINE sends half-time status, predictions pause and interpolation stops. When TxLINE sends second-half live status, predictions resume from the new live clock anchor.
 
 After 90 minutes, predictions close and the frontend shows the final leaderboard instead of opening more rounds.
 
@@ -333,7 +344,9 @@ Fixtures and matches:
 
 ```text
 POST /api/txline/sync-fixtures
-GET  /api/matches
+GET  /api/matches?view=active
+GET  /api/matches?view=past
+GET  /api/matches?view=mine
 GET  /api/matches/:id
 GET  /api/matches/:id/leaderboard
 GET  /api/leaderboard
@@ -422,7 +435,8 @@ Notifications are scoped to the currently opened match screen. The main match li
 
 The frontend is mobile-first and game-oriented:
 
-- Match list with status, kickoff countdown, and score.
+- Match views for live/upcoming fixtures, the current user's participated games, and recent completed fixtures.
+- Match cards with status, kickoff countdown, and score. Completed matches remain openable for their feed, rounds, and final leaderboard.
 - Friend room join panel and room cards for joined rooms.
 - Create-room action from each match card.
 - Private room match screen with shareable room code.
@@ -564,8 +578,9 @@ Demo competition mode is designed for recording a gameplay video. Unlike the vis
 
 - Creates a live `Tunisia vs Netherlands` replay match.
 - Creates demo users.
-- Creates predictions for each demo user.
+- Uses `mike`, `john`, and `sara` as automated competitors while reserving `alex` for manual predictions during recording.
 - Emits a compressed replay based on TxLINE historical data for fixture `17588236`.
+- Persists and broadcasts the same running match-clock fields used by live TxLINE matches, so normal round and prediction validation remains active in the replay.
 - Awards real points through the normal prediction resolver.
 - Updates match score, event timeline, streaks, and match/global leaderboards.
 
@@ -753,7 +768,7 @@ Do not commit real secrets. Only `.example` files should be tracked.
 
 ### TxLINE Resilience
 
-The TxLINE worker retries after stream failures. If credentials are missing or expired, backend startup can succeed but the worker will log TxLINE connection errors.
+The TxLINE worker retries after stream failures. Fixture metadata is refreshed every 5 minutes, active status is reconciled from score snapshots every minute, and recent finished scores are reconciled every 10 minutes. If credentials are missing or expired, backend startup can succeed but the worker and synchronization jobs will log TxLINE connection errors.
 
 ## Known Limitations And Future Improvements
 

@@ -5,7 +5,12 @@ import { Server } from "socket.io";
 import { serverEnv } from "./env.js";
 import { registerRoutes } from "./routes.js";
 import { createTestGameController } from "./test-game.js";
-import { refreshMatchStatuses, syncFixtures } from "./txline.js";
+import {
+  reconcileActiveMatchStatuses,
+  reconcileRecentFinishedMatchScores,
+  refreshMatchStatuses,
+  syncFixtures,
+} from "./txline.js";
 import { startTxLineScoresWorker } from "./txline-worker.js";
 
 const app = Fastify({ logger: true });
@@ -36,9 +41,32 @@ setInterval(() => {
   refreshMatchStatuses().catch((error) => app.log.error(error));
 }, 30_000);
 
-syncFixtures().catch((error) => {
-  app.log.warn({ error }, "Initial TxLINE fixture sync failed");
-});
+setInterval(() => {
+  syncFixtures().catch((error) => app.log.warn({ error }, "TxLINE fixture sync failed"));
+}, 5 * 60_000);
+
+setInterval(() => {
+  reconcileActiveMatchStatuses()
+    .then(({ checked, updated }) => {
+      if (updated > 0) app.log.info({ checked, updated }, "TxLINE match statuses reconciled");
+    })
+    .catch((error) => app.log.warn({ error }, "TxLINE match status reconciliation failed"));
+}, 60_000);
+
+setInterval(() => {
+  reconcileRecentFinishedMatchScores()
+    .then(({ checked, updated }) => {
+      if (updated > 0) app.log.info({ checked, updated }, "TxLINE finished scores reconciled");
+    })
+    .catch((error) => app.log.warn({ error }, "TxLINE finished score reconciliation failed"));
+}, 10 * 60_000);
+
+syncFixtures()
+  .then(async () => {
+    await reconcileActiveMatchStatuses();
+    await reconcileRecentFinishedMatchScores();
+  })
+  .catch((error) => app.log.warn({ error }, "Initial TxLINE sync failed"));
 
 await app.ready();
 

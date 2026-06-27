@@ -6,6 +6,9 @@ import { ingestNormalizedEvent } from "./game-engine.js";
 import { presentEvent } from "./event-presenter.js";
 import { prisma } from "./prisma.js";
 import { ensureRounds, ROUND_LENGTH_MINUTES } from "./txline.js";
+import { demoFixtureId } from "./constants.js";
+
+export { demoFixtureId } from "./constants.js";
 
 type TestGameStatus = {
   enabled: boolean;
@@ -40,7 +43,6 @@ const simulatedEventTypes = [
   EventType.RED_CARD,
 ];
 
-export const demoFixtureId = 9900333;
 const demoPassword = "demo123";
 const demoUsers = ["alex", "mike", "john", "sara"];
 const demoReplayIntervalMs = 3_000;
@@ -176,7 +178,7 @@ export function createTestGameController(io: Server, logger: FastifyBaseLogger):
     if (!script) {
       const finishedMatch = await prisma.match.update({
         where: { id: demoMatchId },
-        data: { status: MatchStatus.FINISHED },
+        data: { status: MatchStatus.FINISHED, clockSeconds: 90 * 60, clockRunning: false, clockUpdatedAt: new Date() },
       });
       stopDemoTimer();
       const finishedMatchId = demoMatchId;
@@ -191,6 +193,13 @@ export function createTestGameController(io: Server, logger: FastifyBaseLogger):
       demoMinute = 0;
       demoTimelineIndex = 0;
       io.emit("leaderboard_updated", { matchId: finishedMatch.id, at: new Date().toISOString(), finished: true });
+      io.emit("match_clock_updated", {
+        matchId: finishedMatch.id,
+        status: MatchStatus.FINISHED,
+        clockSeconds: 90 * 60,
+        clockRunning: false,
+        clockUpdatedAt: new Date().toISOString(),
+      });
       io.emit("test_game_status", getDemoStatus());
       logger.info({ matchId: finishedMatch.id }, "Demo competition finished");
       return;
@@ -200,12 +209,26 @@ export function createTestGameController(io: Server, logger: FastifyBaseLogger):
     demoTimelineIndex += 1;
     demoSequence += 1;
 
+    const clockSeconds = Math.min(demoMinute, 90) * 60;
+    const clockRunning = demoMinute < 90;
+    const matchStatus = clockRunning ? MatchStatus.LIVE : MatchStatus.FINISHED;
+    const clockUpdatedAt = new Date();
     const match = await prisma.match.update({
       where: { id: demoMatchId },
       data: {
-        status: MatchStatus.LIVE,
+        status: matchStatus,
         startTime: new Date(Date.now() - demoMinute * 60_000),
+        clockSeconds,
+        clockRunning,
+        clockUpdatedAt,
       },
+    });
+    io.emit("match_clock_updated", {
+      matchId: match.id,
+      status: matchStatus,
+      clockSeconds,
+      clockRunning,
+      clockUpdatedAt: clockUpdatedAt.toISOString(),
     });
     await ensureRounds(match.id);
 
@@ -220,8 +243,9 @@ export function createTestGameController(io: Server, logger: FastifyBaseLogger):
       select: { id: true, username: true },
     });
 
+    const botUsers = users.filter((user) => user.username !== "alex");
     await prisma.$transaction(
-      users.map((user) =>
+      botUsers.map((user) =>
         prisma.prediction.upsert({
           where: { userId_matchId_roundId: { userId: user.id, matchId: match.id, roundId: round.id } },
           create: {
@@ -353,6 +377,9 @@ export function createTestGameController(io: Server, logger: FastifyBaseLogger):
           participant1IsHome: true,
           startTime: new Date(),
           status: MatchStatus.LIVE,
+          clockSeconds: 0,
+          clockRunning: true,
+          clockUpdatedAt: new Date(),
         },
         update: {
           competition: "World Cup Replay",
@@ -365,6 +392,9 @@ export function createTestGameController(io: Server, logger: FastifyBaseLogger):
           awayScore: 0,
           startTime: new Date(),
           status: MatchStatus.LIVE,
+          clockSeconds: 0,
+          clockRunning: true,
+          clockUpdatedAt: new Date(),
         },
       });
 
@@ -385,6 +415,13 @@ export function createTestGameController(io: Server, logger: FastifyBaseLogger):
       }, demoReplayIntervalMs);
 
       io.emit("test_game_status", getDemoStatus());
+      io.emit("match_clock_updated", {
+        matchId: match.id,
+        status: MatchStatus.LIVE,
+        clockSeconds: 0,
+        clockRunning: true,
+        clockUpdatedAt: match.clockUpdatedAt?.toISOString() ?? new Date().toISOString(),
+      });
       io.emit("leaderboard_updated", { matchId: match.id, at: new Date().toISOString() });
       logger.info({ matchId: match.id }, "Demo competition enabled");
       return getDemoStatus();
@@ -394,7 +431,14 @@ export function createTestGameController(io: Server, logger: FastifyBaseLogger):
       if (demoMatchId) {
         await prisma.match.update({
           where: { id: demoMatchId },
-          data: { status: MatchStatus.FINISHED },
+          data: { status: MatchStatus.FINISHED, clockRunning: false, clockUpdatedAt: new Date() },
+        });
+        io.emit("match_clock_updated", {
+          matchId: demoMatchId,
+          status: MatchStatus.FINISHED,
+          clockSeconds: Math.min(demoMinute, 90) * 60,
+          clockRunning: false,
+          clockUpdatedAt: new Date().toISOString(),
         });
         io.emit("leaderboard_updated", { matchId: demoMatchId, at: new Date().toISOString(), finished: true });
       }

@@ -1,6 +1,9 @@
 import { MatchStatus, type Prisma } from "@prisma/client";
 import { prisma } from "./prisma.js";
 import { requireTxLineCredentials, serverEnv } from "./env.js";
+import type { TxLineScoresRecord } from "../txline/types.js";
+import { soccerGoalsFromRecord, soccerStatusFromRecord } from "./txline-state.js";
+import { demoFixtureId } from "./constants.js";
 
 type TxLineFixture = {
   Ts: number;
@@ -19,6 +22,7 @@ type TxLineFixture = {
 export const ROUND_LENGTH_MINUTES = 3;
 export const MATCH_DURATION_MINUTES = 90;
 const ROUND_COUNT = 30;
+const STALE_LIVE_MATCH_MS = 5 * 60 * 60_000;
 
 export async function syncFixtures(): Promise<{ imported: number }> {
   requireTxLineCredentials();
@@ -65,7 +69,6 @@ export async function syncFixtures(): Promise<{ imported: number }> {
         participant2: fixture.Participant2,
         participant1IsHome: fixture.Participant1IsHome,
         startTime,
-        status,
       },
     });
 
@@ -79,9 +82,7 @@ export function deriveMatchStatus(startTime: Date): MatchStatus {
   const now = Date.now();
   const start = startTime.getTime();
   const openAt = start;
-  const finishAt = start + MATCH_DURATION_MINUTES * 60_000;
 
-  if (now >= finishAt) return MatchStatus.FINISHED;
   if (now >= start) return MatchStatus.LIVE;
   if (now >= openAt) return MatchStatus.OPEN;
   return MatchStatus.SCHEDULED;
@@ -99,6 +100,128 @@ export async function refreshMatchStatuses(): Promise<void> {
       await prisma.match.update({ where: { id: match.id }, data: { status } });
     }
   }
+
+  await prisma.match.updateMany({
+    where: {
+      status: { in: [MatchStatus.LIVE, MatchStatus.HALF_TIME] },
+      startTime: { lte: new Date(Date.now() - STALE_LIVE_MATCH_MS) },
+    },
+    data: { status: MatchStatus.FINISHED, clockRunning: false },
+  });
+}
+
+export async function reconcileActiveMatchStatuses(): Promise<{ checked: number; updated: number }> {
+  requireTxLineCredentials();
+
+  const matches = await prisma.match.findMany({
+    where: { status: { in: [MatchStatus.LIVE, MatchStatus.HALF_TIME] } },
+    select: {
+      id: true,
+      txlineFixtureId: true,
+      status: true,
+      participant1IsHome: true,
+      homeScore: true,
+      awayScore: true,
+    },
+  });
+
+  let updated = 0;
+  await Promise.all(
+    matches.map(async (match) => {
+      const records = (await fetchScoreSnapshot(match.txlineFixtureId)).sort(compareTxLineRecords);
+      const statusRecord = records
+        .filter((record) => soccerStatusFromRecord(record) !== null)
+        .at(-1);
+      const status = statusRecord ? soccerStatusFromRecord(statusRecord) : null;
+      const goals = latestSnapshotGoals(records);
+      const homeScore = goals
+        ? match.participant1IsHome ? goals.participant1 : goals.participant2
+        : match.homeScore;
+      const awayScore = goals
+        ? match.participant1IsHome ? goals.participant2 : goals.participant1
+        : match.awayScore;
+
+      if ((!status || status === match.status) && homeScore === match.homeScore && awayScore === match.awayScore) return;
+
+      await prisma.match.update({
+        where: { id: match.id },
+        data: {
+          ...(status ? { status } : {}),
+          ...(status === MatchStatus.FINISHED ? { clockRunning: false } : {}),
+          homeScore,
+          awayScore,
+        },
+      });
+      updated += 1;
+    }),
+  );
+
+  return { checked: matches.length, updated };
+}
+
+export async function reconcileRecentFinishedMatchScores(): Promise<{ checked: number; updated: number }> {
+  requireTxLineCredentials();
+
+  const matches = await prisma.match.findMany({
+    where: {
+      status: MatchStatus.FINISHED,
+      txlineFixtureId: { not: BigInt(demoFixtureId) },
+    },
+    orderBy: { startTime: "desc" },
+    take: 20,
+    select: {
+      id: true,
+      txlineFixtureId: true,
+      participant1IsHome: true,
+      homeScore: true,
+      awayScore: true,
+    },
+  });
+
+  let updated = 0;
+  await Promise.all(
+    matches.map(async (match) => {
+      const records = (await fetchScoreSnapshot(match.txlineFixtureId)).sort(compareTxLineRecords);
+      const goals = latestSnapshotGoals(records);
+      if (!goals) return;
+
+      const homeScore = match.participant1IsHome ? goals.participant1 : goals.participant2;
+      const awayScore = match.participant1IsHome ? goals.participant2 : goals.participant1;
+      if (homeScore === match.homeScore && awayScore === match.awayScore) return;
+
+      await prisma.match.update({ where: { id: match.id }, data: { homeScore, awayScore } });
+      updated += 1;
+    }),
+  );
+
+  return { checked: matches.length, updated };
+}
+
+async function fetchScoreSnapshot(fixtureId: bigint): Promise<TxLineScoresRecord[]> {
+  const response = await fetch(`${serverEnv.txlineBaseUrl}/api/scores/snapshot/${fixtureId}`, {
+    headers: txLineHeaders(),
+  });
+
+  if (!response.ok) {
+    throw new Error(`TxLINE score snapshot ${fixtureId} failed: ${response.status} ${response.statusText}`);
+  }
+
+  return (await response.json()) as TxLineScoresRecord[];
+}
+
+function latestSnapshotGoals(records: TxLineScoresRecord[]): { participant1: number; participant2: number } | null {
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (!record) continue;
+    const goals = soccerGoalsFromRecord(record);
+    if (goals) return goals;
+  }
+  return null;
+}
+
+function compareTxLineRecords(left: TxLineScoresRecord, right: TxLineScoresRecord): number {
+  return (left.ts ?? left.Ts ?? 0) - (right.ts ?? right.Ts ?? 0)
+    || (left.seq ?? left.Seq ?? 0) - (right.seq ?? right.Seq ?? 0);
 }
 
 export async function ensureRounds(matchId: string): Promise<void> {

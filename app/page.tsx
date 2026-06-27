@@ -6,11 +6,14 @@ import {
   Clock,
   Copy,
   Flame,
+  History,
   LogOut,
   Plus,
+  Radio,
   ShieldCheck,
   Sparkles,
   Trophy,
+  UserRound,
   Users,
   Zap,
 } from "lucide-react";
@@ -32,6 +35,7 @@ type Match = {
   awayScore: number;
   clockSeconds: number;
   clockRunning: boolean;
+  clockUpdatedAt: string | null;
   startTime: string;
   opensAt: string;
   status: "SCHEDULED" | "OPEN" | "LIVE" | "HALF_TIME" | "FINISHED";
@@ -124,6 +128,7 @@ type TestGameStatus = {
 
 type MatchPanelTab = "feed" | "leaderboard" | "rounds";
 type HomeTab = "games" | "rooms" | "leaderboard";
+type MatchListView = "active" | "mine" | "past";
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
 const matchDurationMinutes = 90;
@@ -151,6 +156,7 @@ export default function Home() {
   const [globalCurrentUserRank, setGlobalCurrentUserRank] = useState<LeaderboardRow | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [homeTab, setHomeTab] = useState<HomeTab>("games");
+  const [matchListView, setMatchListView] = useState<MatchListView>("active");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [joinRoomCode, setJoinRoomCode] = useState("");
@@ -169,11 +175,11 @@ export default function Home() {
   const shownPredictionWinsRef = useRef<Set<string>>(new Set());
 
   const loadMatches = useCallback(() => {
-    fetch(`${apiUrl}/api/matches`)
-      .then((response) => response.json())
+    fetch(`${apiUrl}/api/matches?view=${matchListView}`, { credentials: "include" })
+      .then((response) => response.ok ? response.json() : { matches: [] })
       .then((data) => setMatches(data.matches ?? []))
       .catch(() => undefined);
-  }, []);
+  }, [matchListView]);
 
   const loadGlobalLeaderboard = useCallback(() => {
     fetch(`${apiUrl}/api/leaderboard`, { credentials: "include" })
@@ -378,11 +384,11 @@ export default function Home() {
       }
     });
 
-    socket.on("match_clock_updated", (payload: { matchId: string; status: Match["status"]; clockSeconds: number; clockRunning: boolean }) => {
+    socket.on("match_clock_updated", (payload: { matchId: string; status: Match["status"]; clockSeconds: number; clockRunning: boolean; clockUpdatedAt: string | null }) => {
       setMatches((current) =>
         current.map((match) =>
           match.id === payload.matchId
-            ? { ...match, status: payload.status, clockSeconds: payload.clockSeconds, clockRunning: payload.clockRunning }
+            ? { ...match, status: payload.status, clockSeconds: payload.clockSeconds, clockRunning: payload.clockRunning, clockUpdatedAt: payload.clockUpdatedAt }
             : match,
         ),
       );
@@ -390,14 +396,14 @@ export default function Home() {
       if (payload.matchId === selectedMatchId) {
         setDetail((current) =>
           current
-            ? { ...current, match: { ...current.match, status: payload.status, clockSeconds: payload.clockSeconds, clockRunning: payload.clockRunning } }
+            ? { ...current, match: { ...current.match, status: payload.status, clockSeconds: payload.clockSeconds, clockRunning: payload.clockRunning, clockUpdatedAt: payload.clockUpdatedAt } }
             : current,
         );
       }
       if (selectedRoomCode && payload.matchId === openMatchId) {
         setRoomDetail((current) =>
           current
-            ? { ...current, match: { ...current.match, status: payload.status, clockSeconds: payload.clockSeconds, clockRunning: payload.clockRunning } }
+            ? { ...current, match: { ...current.match, status: payload.status, clockSeconds: payload.clockSeconds, clockRunning: payload.clockRunning, clockUpdatedAt: payload.clockUpdatedAt } }
             : current,
         );
       }
@@ -461,6 +467,7 @@ export default function Home() {
     await fetch(`${apiUrl}/api/auth/logout`, { method: "POST", credentials: "include" });
     setUser(null);
     setHomeTab("games");
+    setMatchListView("active");
     setRooms([]);
     setSelectedRoomCode(null);
     setRoomDetail(null);
@@ -621,8 +628,17 @@ export default function Home() {
           <AnimatePresence mode="wait" initial={false}>
             {homeTab === "games" ? (
               <motion.div key="games" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
+                <MatchViewTabs
+                  activeView={matchListView}
+                  setActiveView={(view) => {
+                    setMatches([]);
+                    setMatchListView(view);
+                  }}
+                  showMine={Boolean(user)}
+                />
                 <MatchList
                   matches={matches}
+                  view={matchListView}
                   now={now}
                   user={user}
                   onSelect={(id) => {
@@ -693,6 +709,37 @@ function HomeTabs(props: {
         </button>
       ))}
     </nav>
+  );
+}
+
+function MatchViewTabs({
+  activeView,
+  setActiveView,
+  showMine,
+}: {
+  activeView: MatchListView;
+  setActiveView: (view: MatchListView) => void;
+  showMine: boolean;
+}) {
+  const tabs: Array<{ value: MatchListView; label: string; icon: typeof Radio }> = [
+    { value: "active", label: "Now", icon: Radio },
+    ...(showMine ? [{ value: "mine" as const, label: "My Games", icon: UserRound }] : []),
+    { value: "past", label: "Past", icon: History },
+  ];
+
+  return (
+    <div className={`mb-4 grid gap-1 border-b border-white/10 pb-3 ${tabs.length === 3 ? "grid-cols-3" : "grid-cols-2"}`}>
+      {tabs.map(({ value, label, icon: Icon }) => (
+        <button
+          key={value}
+          onClick={() => setActiveView(value)}
+          className={`flex h-9 items-center justify-center gap-1.5 rounded text-xs font-semibold transition ${activeView === value ? "bg-white/12 text-lime-200" : "text-white/45 hover:bg-white/6 hover:text-white/75"}`}
+        >
+          <Icon size={14} />
+          {label}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -812,25 +859,38 @@ function RoomsPanel(props: {
 
 function MatchList({
   matches,
+  view,
   now,
   user,
   onSelect,
   onCreateRoom,
 }: {
   matches: Match[];
+  view: MatchListView;
   now: number;
   user: User | null;
   onSelect: (id: string) => void;
   onCreateRoom: (id: string) => void;
 }) {
-  const nextMatches = useMemo(() => matches.slice(0, 12), [matches]);
+  const nextMatches = useMemo(() => matches.slice(0, view === "active" ? 12 : 20), [matches, view]);
+  const heading = view === "active" ? "Pick a Match" : view === "mine" ? "My Games" : "Recent Results";
+  const empty = view === "mine"
+    ? "Your games appear here after you join a room or make a prediction."
+    : view === "past"
+      ? "No completed matches yet."
+      : "No live or upcoming matches available.";
 
   return (
     <section>
       <div className="mb-3 flex items-center justify-between">
-        <h2 className="text-lg font-semibold text-white">Pick a Match</h2>
+        <h2 className="text-lg font-semibold text-white">{heading}</h2>
         <span className="rounded bg-white/10 px-2 py-1 text-xs text-white/70">{matches.length} synced</span>
       </div>
+      {nextMatches.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-white/10 bg-black/20 px-5 py-10 text-center text-sm leading-6 text-white/45">
+          {empty}
+        </div>
+      ) : null}
       <div className="space-y-3">
         {nextMatches.map((match, index) => (
           <motion.div
@@ -856,12 +916,16 @@ function MatchList({
                   <Clock size={16} />
                   <span className="truncate">{new Date(match.startTime).toLocaleString()}</span>
                 </div>
-                <span className={now >= new Date(match.opensAt).getTime() ? "text-lime-200" : "text-white/70"}>
-                  {now >= new Date(match.opensAt).getTime() ? "Open" : formatDuration(new Date(match.startTime).getTime() - now)}
+                <span className={match.status === "FINISHED" ? "text-white/55" : now >= new Date(match.opensAt).getTime() ? "text-lime-200" : "text-white/70"}>
+                  {match.status === "FINISHED"
+                    ? "Full time"
+                    : now >= new Date(match.opensAt).getTime()
+                      ? "Open"
+                      : formatDuration(new Date(match.startTime).getTime() - now)}
                 </span>
               </div>
             </button>
-            {user ? (
+            {user && match.status !== "FINISHED" ? (
               <div className="relative mt-3 border-t border-white/10 pt-3">
                 <button
                   onClick={() => onCreateRoom(match.id)}
@@ -909,7 +973,7 @@ function MatchExperience(props: {
   const currentRound = predictionRound;
   const myState = props.detail?.myState ?? { score: 0, streak: 0 };
   const selectedPrediction = props.detail?.myPredictions.find((prediction) => prediction.roundId === predictionRound?.id && prediction.status !== "CANCELED");
-  const fullTime = match.status === "FINISHED" || match.clockSeconds >= matchDurationMinutes * 60;
+  const fullTime = match.status === "FINISHED" || getEffectiveClockSeconds(match, props.now) >= matchDurationMinutes * 60;
   const halfTime = isHalfTime(match, props.now);
   const timeToLock = predictionRound ? getMsUntilRoundEnd(match, predictionRound, props.now) : null;
   const finalSeconds = timeToLock !== null && timeToLock > 0 && timeToLock <= 10_000;
@@ -1006,75 +1070,87 @@ function MatchExperience(props: {
               <h2 className="font-semibold text-white">Prediction</h2>
               <span className="text-xs text-white/50">{halfTime ? "Paused" : "Closes in final 10 seconds"}</span>
             </div>
-            {selectedPrediction ? (
-              <div className={`mb-3 rounded-lg border p-3 ${canCancelPrediction ? "border-lime-300/45 bg-lime-300/12 shadow-lg shadow-lime-300/10" : "border-white/10 bg-black/25"}`}>
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <div className="text-sm font-semibold text-white">
-                      {canCancelPrediction ? "Confirming prediction" : "Prediction locked"}
-                    </div>
-                    <div className="mt-1 text-xs text-white/50">
-                      {canCancelPrediction
-                        ? "You can cancel before it activates. Events only count after activation."
-                        : "This round's prediction cannot be changed."}
-                    </div>
-                  </div>
-                  {canCancelPrediction ? (
-                    <button
-                      onClick={() => props.onCancelPrediction(selectedPrediction.id)}
-                      className="h-10 rounded-md border border-red-300/40 bg-red-400/10 px-3 text-xs font-black text-red-100 transition hover:bg-red-400/20"
-                    >
-                      Cancel
-                    </button>
-                  ) : null}
-                </div>
-                {canCancelPrediction ? (
-                  <div className="mt-3">
-                    <div className="mb-2 flex items-end justify-between">
-                      <span className="text-xs font-semibold uppercase tracking-[0.14em] text-lime-100">Locks in</span>
-                      <span className="font-mono text-3xl font-black leading-none text-white">{confirmationSecondsRemaining}s</span>
-                    </div>
-                    <div className="h-2 overflow-hidden rounded-full bg-white/10">
-                      <motion.div
-                        className="h-full rounded-full bg-lime-300"
-                        initial={false}
-                        animate={{ width: `${confirmationProgress}%` }}
-                        transition={{ duration: 0.2, ease: "linear" }}
-                      />
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
             {halfTime ? (
               <div className="rounded-lg border border-white/10 bg-black/25 px-4 py-6 text-center text-sm font-semibold text-white/55">
                 Waiting for second half kickoff
               </div>
             ) : (
-            <div className="grid grid-cols-2 gap-2">
-              {predictionOptions.map((option) => {
-                const active = selectedPrediction?.predictionType === option.value;
-                return (
-                  <motion.button
-                    key={option.value}
-                    disabled={predictionButtonsDisabled}
-                    onClick={() => props.onSubmit(option.value)}
-                    className={`relative h-[82px] overflow-hidden rounded-lg border p-3 text-left transition disabled:opacity-40 ${active ? "border-white bg-lime-300 text-black shadow-lg shadow-lime-300/20" : "border-white/10 bg-white/8 text-white"}`}
-                    whileTap={{ scale: 0.96 }}
-                    animate={active ? { y: [0, -2, 0] } : { y: 0 }}
-                    transition={active ? { repeat: Infinity, duration: 1.4 } : undefined}
-                  >
-                    <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${option.tone}`} />
-                    <div className="mb-2 flex items-center justify-between">
-                      <span className="text-2xl leading-none">{option.icon}</span>
-                      <span className={active ? "text-xs font-black text-black/60" : "text-xs font-black text-lime-200"}>+{option.points}</span>
-                    </div>
-                    <div className="text-sm font-black">{option.label}</div>
-                    <div className={active ? "text-xs text-black/70" : "text-xs text-white/50"}>{option.points} base points</div>
-                  </motion.button>
-                );
-              })}
-            </div>
+              <div className="relative">
+                <div className="grid grid-cols-2 gap-2">
+                  {predictionOptions.map((option) => {
+                    const active = selectedPrediction?.predictionType === option.value;
+                    return (
+                      <motion.button
+                        key={option.value}
+                        disabled={predictionButtonsDisabled}
+                        onClick={() => props.onSubmit(option.value)}
+                        className={`relative h-[82px] overflow-hidden rounded-lg border p-3 text-left transition disabled:opacity-40 ${active ? "border-white bg-lime-300 text-black shadow-lg shadow-lime-300/20" : "border-white/10 bg-white/8 text-white"}`}
+                        whileTap={{ scale: 0.96 }}
+                        animate={active ? { y: [0, -2, 0] } : { y: 0 }}
+                        transition={active ? { repeat: Infinity, duration: 1.4 } : undefined}
+                      >
+                        <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${option.tone}`} />
+                        <div className="mb-2 flex items-center justify-between">
+                          <span className="text-2xl leading-none">{option.icon}</span>
+                          <span className={active ? "text-xs font-black text-black/60" : "text-xs font-black text-lime-200"}>+{option.points}</span>
+                        </div>
+                        <div className="text-sm font-black">{option.label}</div>
+                        <div className={active ? "text-xs text-black/70" : "text-xs text-white/50"}>{option.points} base points</div>
+                      </motion.button>
+                    );
+                  })}
+                </div>
+
+                <AnimatePresence>
+                  {selectedPrediction ? (
+                    <motion.div
+                      className="absolute inset-0 z-20 rounded-lg bg-black/55 p-3 backdrop-blur-[2px]"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                    >
+                      <div className={`rounded-lg border p-3 ${canCancelPrediction ? "border-lime-300/45 bg-[#202d18] shadow-lg shadow-lime-300/10" : "border-white/10 bg-[#151815]"}`}>
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="text-sm font-semibold text-white">
+                              {canCancelPrediction ? "Confirming prediction" : "Prediction locked"}
+                            </div>
+                            <div className="mt-1 text-xs text-white/50">
+                              {canCancelPrediction
+                                ? "You can cancel before it activates. Events only count after activation."
+                                : "This round's prediction cannot be changed."}
+                            </div>
+                          </div>
+                          {canCancelPrediction ? (
+                            <button
+                              onClick={() => props.onCancelPrediction(selectedPrediction.id)}
+                              className="h-10 rounded-md border border-red-300/40 bg-red-400/10 px-3 text-xs font-black text-red-100 transition hover:bg-red-400/20"
+                            >
+                              Cancel
+                            </button>
+                          ) : null}
+                        </div>
+                        {canCancelPrediction ? (
+                          <div className="mt-3">
+                            <div className="mb-2 flex items-end justify-between">
+                              <span className="text-xs font-semibold uppercase tracking-[0.14em] text-lime-100">Locks in</span>
+                              <span className="font-mono text-3xl font-black leading-none text-white">{confirmationSecondsRemaining}s</span>
+                            </div>
+                            <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                              <motion.div
+                                className="h-full rounded-full bg-lime-300"
+                                initial={false}
+                                animate={{ width: `${confirmationProgress}%` }}
+                                transition={{ duration: 0.2, ease: "linear" }}
+                              />
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    </motion.div>
+                  ) : null}
+                </AnimatePresence>
+              </div>
             )}
           </section>
         </>
@@ -1546,7 +1622,8 @@ function getRoundAtTime(match: Match, rounds: Round[], now: number) {
 }
 
 function getMatchElapsedMinute(match: Match, now: number) {
-  if (match.clockSeconds > 0) return Math.floor(match.clockSeconds / 60);
+  const clockSeconds = getEffectiveClockSeconds(match, now);
+  if (clockSeconds > 0 || match.clockRunning) return Math.floor(clockSeconds / 60);
   if (match.status === "LIVE") return null;
 
   const kickoff = new Date(match.startTime).getTime();
@@ -1555,8 +1632,9 @@ function getMatchElapsedMinute(match: Match, now: number) {
 }
 
 function getMsUntilRoundEnd(match: Match, round: Round, now: number) {
-  if (match.clockSeconds > 0) {
-    return Math.max(0, (round.endMinute * 60 - match.clockSeconds) * 1000);
+  const clockSeconds = getEffectiveClockSeconds(match, now);
+  if (clockSeconds > 0 || match.clockRunning) {
+    return Math.max(0, (round.endMinute * 60 - clockSeconds) * 1000);
   }
   if (match.status === "LIVE") return null;
 
@@ -1565,15 +1643,23 @@ function getMsUntilRoundEnd(match: Match, round: Round, now: number) {
 }
 
 function isHalfTime(match: Match, now: number) {
-  if (match.clockRunning && match.clockSeconds > 45 * 60) return false;
+  const clockSeconds = getEffectiveClockSeconds(match, now);
+  if (match.clockRunning && clockSeconds > 45 * 60) return false;
   if (match.status === "HALF_TIME") return true;
   if (match.status !== "LIVE") return false;
-  if (match.clockSeconds >= 45 * 60 && match.clockSeconds < 46 * 60 && !match.clockRunning) return true;
+  if (clockSeconds >= 45 * 60 && clockSeconds < 46 * 60 && !match.clockRunning) return true;
 
   const kickoff = new Date(match.startTime).getTime();
   if (!Number.isFinite(kickoff)) return false;
   const wallClockMinute = Math.floor((now - kickoff) / 60_000);
   return match.clockSeconds === 0 && wallClockMinute >= 45 && wallClockMinute < 65;
+}
+
+function getEffectiveClockSeconds(match: Match, now: number): number {
+  if (!match.clockRunning || !match.clockUpdatedAt) return match.clockSeconds;
+  const syncedAt = new Date(match.clockUpdatedAt).getTime();
+  if (!Number.isFinite(syncedAt)) return match.clockSeconds;
+  return match.clockSeconds + Math.max(0, Math.floor((now - syncedAt) / 1000));
 }
 
 function formatMultiplier(streak: number) {
