@@ -446,6 +446,12 @@ The frontend is mobile-first and game-oriented:
 - Live event timeline.
 - Match leaderboard.
 - Global leaderboard.
+
+### Frontend State And Components
+
+The frontend uses React's built-in state management rather than Redux or MobX. `useGameController` owns the screen-level state, API polling, authentication actions, navigation state, and Socket.IO subscriptions. Match and leaderboard data remains server-authoritative; the client only caches the latest responses and applies realtime updates.
+
+Shared domain types, configuration, and pure formatting/clock utilities live under `app/game/`. Visual components live under `app/game/components/`, with one exported React component per file and a 150-line maximum. `app/page.tsx` is only the top-level composition layer.
 - Animated event banners and prediction success notices.
 
 The frontend defaults to same-origin API calls:
